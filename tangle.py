@@ -17,9 +17,18 @@ class Watcher(Thread):
         super().__init__()
         self.path = path
         self.fd_map = {}
+        self.dir_fd_map = {}
         self.events = []
         self.die = False
         self.kq = kqueue()
+
+    def register_dir(self, dir_fd, dir_name, files):
+        self.dir_fd_map[dir_fd] = (dir_name, files)
+        event = kevent(dir_fd, filter=KQ_FILTER_VNODE,
+                       flags=KQ_EV_ADD | KQ_EV_ENABLE | KQ_EV_CLEAR,
+                       fflags=KQ_NOTE_RENAME | KQ_NOTE_WRITE | KQ_NOTE_DELETE | KQ_NOTE_ATTRIB)
+        self.events.append(event)
+        print("[registerd dir %s -> %s]" % (dir_name, dir_fd))
 
     def register_file(self, dir_fd, filename):
         fd = os.open(filename, os.O_RDONLY, dir_fd=dir_fd)
@@ -35,8 +44,12 @@ class Watcher(Thread):
         for root, dirs, files, rootfd in os.fwalk(self.path):
             for i in IGNORES:
                 if i in dirs: dirs.remove(i)
+
+            dir_fd = os.dup(rootfd)
+            self.register_dir(dir_fd, root, files)
+
             for f in files:
-                self.register_file(os.dup(rootfd), f)
+                self.register_file(dir_fd, f)
                 
 
         while not self.die:
@@ -45,7 +58,11 @@ class Watcher(Thread):
                 print("...nothing yet...")
             else:
                 for event in events:
-                    print("[!] %s" % self.fd_map.get(event.ident, "???"))
+                    fd = event.ident
+                    if fd in self.dir_fd_map:
+                        print("[d!] %s" % self.dir_fd_map[fd][0])
+                    elif fd in self.fd_map:
+                        print("[f!] %s" % self.fd_map[fd])
 
 
     def stop(self):
