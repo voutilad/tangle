@@ -12,6 +12,9 @@ IGNORES = [".git", "CVS", ".svn", ".hg"]
 watcher = None
 
 class Watcher(Thread):
+    """ kqueue specific directory and file watcher"""
+    #XXX: currently doesn't UNregister events! Plus it
+    #     might be constantly REregistering events
 
     def __init__(self, path):
         super().__init__()
@@ -104,6 +107,7 @@ class Watcher(Thread):
         name = self.fd_map[fd]
 
         if flags & KQ_NOTE_RENAME:
+            self.unregister_file(fd)
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:
@@ -127,7 +131,7 @@ class Watcher(Thread):
 
         self.die = True
 
-
+# WTF this doesn't work reliable cross platform!!!
 # def handle_signals(signal_num, stack_frame):
 #     print("[debug] signal_num: %s, stack_frame: %s" % (signal_num, str(stack_frame)))
 #     if signal_num == SIGINT:
@@ -144,6 +148,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         path = sys.argv[1]
 
+    print("Starting watcher on %s\nHit ENTER to stop." % path)
     watcher = Watcher(path)
     watcher.start()
 
