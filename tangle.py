@@ -7,7 +7,8 @@ from select import *
 from time import sleep
 from threading import Thread
 
-IGNORES = [".git", "CVS", ".svn", ".hg"]
+IGNORE_DIRS = [".git", "CVS", ".svn", ".hg"]
+IGNORE_PATTERNS = [".#"]
 
 watcher = None
 
@@ -21,7 +22,7 @@ class Watcher(Thread):
         self.path = path
         self.fd_map = {}
         self.dir_fd_map = {}
-        self.events = []
+        self.changelist = []
         self.die = False
         self.kq = kqueue()
 
@@ -35,42 +36,67 @@ class Watcher(Thread):
     def register_dir(self, dir_fd, dir_name, files):
         self.dir_fd_map[dir_fd] = (dir_name, files)
         event = self.new_event(dir_fd) 
-        self.events.append(event)
+        self.changelist.append(event)
         print("[registered dir %s -> %s]" % (dir_name, dir_fd))
 
     def register_file(self, dir_fd, filename):
         fd = os.open(filename, os.O_RDONLY, dir_fd=dir_fd)
         self.fd_map[fd] = filename
         event = self.new_event(fd)
-        self.events.append(event)
-
+        self.changelist.append(event)
         print("[registered %s -> %s]" % (dir_fd, filename))
 
     def unregister_file(self, fd):
         if fd in self.fd_map:
-            event = None
-            for e in self.events:
-                if e.ident == fd:
-                    event = e
-            self.events.remove(event)
+            self.changelist.append(kevent(fd, filter=KQ_FILTER_VNODE,
+                                          flags=KQ_EV_DELETE))
             os.close(fd)
             name = self.fd_map.pop(fd)
             print("[unregistered %s -> %s]" % (fd, name))
 
+    def update_dir(self, dir_fd):
+        """Handle state changes to directories"""
+        (dirpath, dirnames, filenames, dirfd) = next(os.fwalk(dir_fd=dir_fd))
+        for seen in self.dir_fd_map[dir_fd][1]:
+            if seen in filenames:
+                filenames.remove(seen)
+
+        for newfile in filenames:
+            ignore = False
+            for i in IGNORE_PATTERNS:
+                if newfile.startswith(i):
+                    filenames.remove(newfile)
+                    ignore = True
+                    break
+            if not ignore:
+                self.register_file(dir_fd, newfile)
+                self.dir_fd_map[dir_fd][1].append(newfile)
+        return filenames
+
     def run(self):
+        """Main event loop for Watcher"""
         for root, dirs, files, rootfd in os.fwalk(self.path):
-            for i in IGNORES:
-                if i in dirs: dirs.remove(i)
+            for i in IGNORE_DIRS:
+                if i in dirs:
+                    dirs.remove(i)
+                    print("[ignoring %s/%s/]" % (root, i))
 
             dir_fd = os.dup(rootfd)
             self.register_dir(dir_fd, root, files)
 
             for f in files:
-                self.register_file(dir_fd, f)
+                ignore = False
+                for i in IGNORE_PATTERNS:
+                    if f.startswith(i):
+                        ignore = True
+                        break
+                if not ignore: self.register_file(dir_fd, f)
+                else: print("[ignoring %s/%s]" % (root, f))
                 
-
         while not self.die:
-            events = self.kq.control(self.events, len(self.events), 1)
+            #XXX: without a timeout, no clean way to break out!
+            events = self.kq.control(self.changelist, 1, 1)
+            self.changelist.clear()
             for event in events:
                 fd = event.ident
                 if fd in self.dir_fd_map:
@@ -79,29 +105,29 @@ class Watcher(Thread):
                     self.handle_file_event(fd, event)
 
     def handle_dir_event(self, dir_fd, event):
+        """Process directory-specific kevents"""
         flags = event.fflags
         actions = []
         if flags & KQ_NOTE_RENAME:
+            
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:
             actions.append("delete")
 
         if flags & KQ_NOTE_WRITE:
-            (dirpath, dirnames, filenames, dirfd) = next(os.fwalk(dir_fd=dir_fd))
-            for seen in self.dir_fd_map[dir_fd][1]:
-                if seen in filenames:
-                    filenames.remove(seen)
-            for newfile in filenames:
-                self.register_file(dir_fd, newfile)
-                self.dir_fd_map[dir_fd][1].append(newfile)
-            actions.append("write (%s)" % str(filenames))
+            filenames = self.update_dir(dir_fd)
+            if len(filenames) > 0:
+                actions.append("write (%s)" % str(filenames))
+            else:
+                actions.append("writes ignored")
 
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
         print("[d!] %s - %s" % (self.dir_fd_map[dir_fd][0], actions))
 
     def handle_file_event(self, fd, event):
+        """Process file kevents"""
         flags = event.fflags
         actions = []
         name = self.fd_map[fd]
