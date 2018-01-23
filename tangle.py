@@ -2,9 +2,10 @@
 import os
 import sys
 
-from signal import SIGINT, SIGINFO, signal
-from select import *
-from time import sleep
+from select import (
+    kqueue, kevent, KQ_FILTER_VNODE, KQ_EV_ADD, KQ_EV_ENABLE, KQ_EV_CLEAR,
+    KQ_EV_DELETE, KQ_NOTE_RENAME, KQ_NOTE_WRITE, KQ_NOTE_DELETE, KQ_NOTE_ATTRIB
+)
 from threading import Thread
 
 IGNORE_DIRS = [".git", "CVS", ".svn", ".hg"]
@@ -12,32 +13,38 @@ IGNORE_PATTERNS = [".#"]
 
 watcher = None
 
+
 class Watcher(Thread):
     """ kqueue specific directory and file watcher"""
-    #XXX: currently doesn't UNregister events! Plus it
-    #     might be constantly REregistering events
 
     def __init__(self, path):
         super().__init__()
         self.path = path
-        self.fd_map = {}
-        self.dir_fd_map = {}
+        self.fd_map = {}        # fd -> name
+        self.dir_fd_map = {}    # fd -> (name, [files], [dirs])
         self.changelist = []
         self.die = False
         self.kq = kqueue()
 
     @staticmethod
     def new_event(fd):
+        """Build new ADD-enabled kevent"""
         return kevent(fd, filter=KQ_FILTER_VNODE,
                       flags=KQ_EV_ADD | KQ_EV_ENABLE | KQ_EV_CLEAR,
                       fflags=KQ_NOTE_RENAME | KQ_NOTE_WRITE |
-                             KQ_NOTE_DELETE | KQ_NOTE_ATTRIB)
+                      KQ_NOTE_DELETE | KQ_NOTE_ATTRIB)
 
-    def register_dir(self, dir_fd, dir_name, files):
-        self.dir_fd_map[dir_fd] = (dir_name, files)
-        event = self.new_event(dir_fd) 
+    def register_dir(self, dir_fd, dir_name, files, dirs):
+        if files is None:
+            files = []
+        if dirs is None:
+            dirs = []
+
+        self.dir_fd_map[dir_fd] = (dir_name, files, dirs)
+        event = self.new_event(dir_fd)
         self.changelist.append(event)
-        print("[registered dir %s -> %s]" % (dir_name, dir_fd))
+        print("[registered dir %s -> %s (%d files, %d dirs)]"
+              % (dir_name, dir_fd, len(files), len(dirs)))
 
     def register_file(self, dir_fd, filename):
         fd = os.open(filename, os.O_RDONLY, dir_fd=dir_fd)
@@ -57,10 +64,25 @@ class Watcher(Thread):
     def update_dir(self, dir_fd):
         """Handle state changes to directories"""
         (dirpath, dirnames, filenames, dirfd) = next(os.fwalk(dir_fd=dir_fd))
+
+        # handle changes to subdirs
+        for seen in self.dir_fd_map[dir_fd][2]:
+            if seen in dirnames:
+                dirnames.remove(seen)
+        for newdir in dirnames:
+            if newdir in IGNORE_DIRS:
+                dirnames.remove(newdir)
+            else:
+                new_dir_fd = os.open(newdir,
+                                     os.O_RDONLY | os.O_DIRECTORY,
+                                     dir_fd=dir_fd)
+                self.dir_fd_map[new_dir_fd] = (newdir, [], [])
+                self.update_dir(new_dir_fd)
+
+        # handle changes in this dir's files
         for seen in self.dir_fd_map[dir_fd][1]:
             if seen in filenames:
                 filenames.remove(seen)
-
         for newfile in filenames:
             ignore = False
             for i in IGNORE_PATTERNS:
@@ -71,10 +93,12 @@ class Watcher(Thread):
             if not ignore:
                 self.register_file(dir_fd, newfile)
                 self.dir_fd_map[dir_fd][1].append(newfile)
-        return filenames
+
+        return (filenames, dirnames)
 
     def run(self):
         """Main event loop for Watcher"""
+        # bootstrap
         for root, dirs, files, rootfd in os.fwalk(self.path):
             for i in IGNORE_DIRS:
                 if i in dirs:
@@ -82,7 +106,7 @@ class Watcher(Thread):
                     print("[ignoring %s/%s/]" % (root, i))
 
             dir_fd = os.dup(rootfd)
-            self.register_dir(dir_fd, root, files)
+            self.register_dir(dir_fd, root, files, dirs)
 
             for f in files:
                 ignore = False
@@ -90,11 +114,14 @@ class Watcher(Thread):
                     if f.startswith(i):
                         ignore = True
                         break
-                if not ignore: self.register_file(dir_fd, f)
-                else: print("[ignoring %s/%s]" % (root, f))
-                
+                if not ignore:
+                    self.register_file(dir_fd, f)
+                else:
+                    print("[ignoring %s/%s]" % (root, f))
+
+        # main event loop
         while not self.die:
-            #XXX: without a timeout, no clean way to break out!
+            # XXX: without a timeout, no clean way to break out!
             events = self.kq.control(self.changelist, 1, 1)
             self.changelist.clear()
             for event in events:
@@ -109,16 +136,16 @@ class Watcher(Thread):
         flags = event.fflags
         actions = []
         if flags & KQ_NOTE_RENAME:
-            
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:
             actions.append("delete")
 
         if flags & KQ_NOTE_WRITE:
-            filenames = self.update_dir(dir_fd)
-            if len(filenames) > 0:
-                actions.append("write (%s)" % str(filenames))
+            filenames, dirnames = self.update_dir(dir_fd)
+            if len(filenames) > 0 or len(dirnames) > 0:
+                actions.append("write (%s), (%s)"
+                               % (str(filenames), str(dirnames)))
             else:
                 actions.append("writes ignored")
 
@@ -157,17 +184,6 @@ class Watcher(Thread):
 
         self.die = True
 
-# WTF this doesn't work reliable cross platform!!!
-# def handle_signals(signal_num, stack_frame):
-#     print("[debug] signal_num: %s, stack_frame: %s" % (signal_num, str(stack_frame)))
-#     if signal_num == SIGINT:
-#         sys.stdout.write("\010\010\010")
-#         print("CTRL-C detected.")
-#         watcher.stop()
-#     elif signal_num == SIGINFO:
-#         sys.stdout.write("\010\010\010")
-#         print("Watcher is watching %s files." % len(watcher.events))
-
 
 if __name__ == "__main__":
     path = "."
@@ -178,8 +194,6 @@ if __name__ == "__main__":
     watcher = Watcher(path)
     watcher.start()
 
-    #signal(SIGINT, handle_signals)
-    #signal(SIGINFO, handle_signals)
     try:
         input()
     except KeyboardInterrupt:
