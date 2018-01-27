@@ -22,7 +22,7 @@ if __name__ == "__main__":
 
     print("Final watcher status:")
     from pprint import pprint
-    print("fd_map:")
-    pprint(watcher.fd_map)
-    print("fd_dir_map:")
-    pprint(watcher.dir_fd_map)
+    print("file_map:")
+    pprint(watcher.file_map)
+    print("dir_map:")
+    pprint(watcher.dir_map)
