@@ -193,6 +193,9 @@ class Watcher(Thread):
                 # print("[debug] new file %s w/ inode %d" % (name, inode))
                 self.register_file(fd, name, inode)
                 self.dir_map[dir_inode][2].add(name)
+            else:
+                # just update if needed
+                self.file_map[inode] = (fd, name)
 
         # we won't have events on new files yet
         # for newfile in new_files:
@@ -306,7 +309,7 @@ class Watcher(Thread):
         #      and we open a new one in the update_dir() routine calling
         #      register_file()
         if flags & KQ_NOTE_RENAME:
-            self.unregister_file(inode)
+            # self.unregister_file(inode)
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:
