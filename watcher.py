@@ -25,10 +25,9 @@ class Watcher(Thread):
     def __init__(self, path):
         super().__init__()
         self.path = path
-        self.root_fd = -1
+        self.root_fd = None
         self.file_map = {}     # file inode -> (fd, name)
-        # dir inode  -> (dir_fd, name, [file inodes], [dirs])
-        self.dir_map = {}
+        self.dir_map = {}       # inode -> (fd, name, {files}, {dirs})
         self.changelist = []
         self.die = False
         self.kq = kqueue()
@@ -62,11 +61,10 @@ class Watcher(Thread):
         :param fd: file descriptor for the directory to register
         :param dirname: `str` name of the directory
         :param inode: inode number for the directory
-        :param files: list of filenames known in the directory, default: None
-        :param dirs: list of directories known in the given directory,
+        :param files: list of file inodes known in the directory, default: None
+        :param dirs: list of directory inodes known in the given directory,
                      default: None
         :returns: None
-        TOOD: is files/dirs inodes or names???
         """
         if files is None:
             files = set()
@@ -134,13 +132,26 @@ class Watcher(Thread):
                   % (inode, name, dir_fd))
 
     @staticmethod
-    def fstat_by_name(filename, is_dir=False, dir_fd=None):
+    def fstat_by_name(path, is_dir=False, dir_fd=None):
+        """
+        Get stats (via `fstat(2)`), specifically an inode number, for a given
+        path to a file or directory.
+
+        :param path: string path to file or directory
+        :param is_dir: is the path a directory? (default: False)
+        :param dir_fd: file descriptor to use as the basis for resolving path
+                       (default: None)
+        :returns: tuple of (path, fd, inode)
+
+        TODO: refactor into just getting inode, autoclose fd immediately
+              as this is leaking fd's most likely
+        """
         opts = os.O_RDONLY
         if is_dir:
             opts = os.O_RDONLY | os.O_DIRECTORY
-        fd = os.open(filename, opts, dir_fd=dir_fd)
+        fd = os.open(path, opts, dir_fd=dir_fd)
         inode = os.fstat(fd).st_ino
-        return (filename, fd, inode)
+        return (path, fd, inode)
 
     def ignore_file(self, filename):
         for pattern in IGNORE_PATTERNS:
@@ -148,7 +159,74 @@ class Watcher(Thread):
                 return True
         return False
 
-    def update_dir(self, dir_inode):
+    def update_file(self, fd, name, inode):
+        if inode in self.file_map:
+            old_fd, old_name = self.file_map[inode]
+            if fd != old_fd:
+                os.close(old_fd)
+                self.changelist.append(self.new_event(fd, inode))
+            if old_name != name:
+                print("[debug] file rename detected %s -> %s"
+                      % (old_name, name))
+            self.file_map[inode] = (fd, name)
+
+    def update_dir(self, fd, name, inode):
+        if inode in self.dir_map:
+            old_fd, old_name, files, dirs = self.dir_map[inode]
+            if fd != old_fd:
+                os.close(old_fd)
+                self.changelist.append(self.new_event(fd, inode))
+            if old_name != name:
+                print("[debug] dir rename detected %s -> %s"
+                      % (old_name, name))
+            self.dir_map[inode] = (fd, name, files, dirs)
+
+    def inode_for(self, path, is_dir=False, dir_fd=None):
+        opts = os.O_RDONLY
+        if is_dir:
+            opts = os.O_RDONLY | os.O_DIRECTORY
+        fd = os.open(path, opts, dir_fd=dir_fd)
+        inode = os.fstat(fd).st_ino
+        os.close(fd)
+        return inode
+
+    def rename_dir(self, dir_inode):
+        """
+        Rename a given directory and its children.
+
+        :param dir_inode: inode of directory to rename
+        :returns: new name of directory
+        """
+        fd, name = self.dir_map[dir_inode][:2]
+        parent = os.path.dirname(name)
+        new_name = ''
+        root, dirs, _, _ = next(os.fwalk(parent, dir_fd=self.root_fd))
+
+        # find the new directory name
+        for d in dirs:
+            path = os.path.join(root, d)
+            inode = self.inode_for(path, is_dir=True, dir_fd=self.root_fd)
+            if dir_inode == inode:
+                new_name = os.path.join(parent, d)
+                print("[debug] found rename target %s" % new_name)
+
+        # inline function for recursively renaming children
+        def rename_children(parent_path, child_inode):
+            fd, name, files, dirs = self.dir_map[child_inode]
+            old_parent, dir_name = os.path.split(name)
+            new_name = os.path.join(parent_path, dir_name)
+            self.dir_map[child_inode] = (fd, new_name, files, dirs)
+            for child in dirs:
+                rename_children(new_name, child)
+
+        # walk the children, renaming them as we go
+        if new_name:
+            for child in self.dir_map[dir_inode][3]:
+                rename_children(new_name, child)
+
+        return new_name
+
+    def process_dir(self, dir_inode):
         """
         Handle state changes to directories, finding changes to subdirectories
         as well as any files.
@@ -162,57 +240,63 @@ class Watcher(Thread):
         tuple is ordered like: `(<files>, <dirs>)`
         """
         dir_fd = self.dir_map[dir_inode][0]
-        (dirpath, dirnames, filenames, dirfd) = next(os.fwalk(dir_fd=dir_fd))
+        dir_name = self.dir_map[dir_inode][1]
 
-        filenames = set(f for f in filenames if not self.ignore_file(f))
-        dirnames = set(dirnames).difference(IGNORE_DIRS)
+        (root, dirs, files, rootfd) = next(os.fwalk(dir_fd=dir_fd))
+        for i in IGNORE_DIRS:
+            if i in dirs:
+                dirs.remove(i)
 
-        file_stats = [self.fstat_by_name(f, dir_fd=dir_fd)
-                      for f in filenames]
-        dir_stats = [self.fstat_by_name(d, is_dir=True, dir_fd=dir_fd)
-                     for d in dirnames]
+        file_stats = {}
+        f_inodes = set()
+        for f in files:
+            if not self.ignore_file(f):
+                name, fd, f_inode = self.fstat_by_name(f, dir_fd=dir_fd)
+                if f_inode in self.file_map:
+                    os.close(fd)
+                    fd = self.file_map[f_inode][0]
+                file_stats[f_inode] = (name, fd)
+                f_inodes.add(f_inode)
+                self.update_file(fd, name, f_inode)
 
-        removed_files = self.dir_map[dir_inode][2].difference(filenames)
-        removed_dirs = self.dir_map[dir_inode][3].difference(dirnames)
+        dir_stats = {}
+        d_inodes = set()
+        for d in dirs:
+            name, fd, d_inode = self.fstat_by_name(d, is_dir=True, dir_fd=dir_fd)
+            if d_inode in self.dir_map:
+                os.close(fd)
+                fd = self.dir_map[d_inode][0]
+            dir_stats[d_inode] = (os.path.join(dir_name, name), fd)
+            d_inodes.add(d_inode)
+            self.update_dir(fd, os.path.join(dir_name, name), d_inode)
 
-        for name in removed_files:
-            self.dir_map[dir_inode][2].remove(name)
-        for name in removed_dirs:
-            self.dir_map[dir_inode][3].remove(name)
+        removed_files = self.dir_map[dir_inode][2].difference(f_inodes)
+        removed_dirs = self.dir_map[dir_inode][3].difference(d_inodes)
+        # print("[debug] %s has removed files: %s, dirs: %s"
+        # % (dir_name, removed_files, removed_dirs))
 
-        for name, fd, inode in dir_stats:
-            if inode not in self.dir_map:
-                # net new inode for a dir!
-                self.dir_map[dir_inode][3].add(name)
-                self.register_dir(fd, name, inode)
-                # print("[debug] new dir %s w/ inode %d" % (name, inode))
+        # remove any moved files, de-reg is handled w/ KQ_NOTE_DELETE's
+        for f_inode in removed_files:
+            self.dir_map[dir_inode][2].remove(f_inode)
+        for d_inode in removed_dirs:
+            self.dir_map[dir_inode][3].remove(d_inode)
 
-        for name, fd, inode in file_stats:
-            if inode not in self.file_map:
-                # net new inode for a file!
-                # print("[debug] new file %s w/ inode %d" % (name, inode))
-                self.register_file(fd, name, inode)
-                self.dir_map[dir_inode][2].add(name)
-            else:
-                # just update if needed
-                self.file_map[inode] = (fd, name)
+        new_files = f_inodes.difference(self.dir_map[dir_inode][2])
+        new_dirs = d_inodes.difference(self.dir_map[dir_inode][3])
 
-        # we won't have events on new files yet
-        # for newfile in new_files:
-        #     ignore = False
-        #     for i in IGNORE_PATTERNS:
-        #         if newfile.startswith(i):
-        #             new_files.remove(newfile)
-        #             ignore = True
-        #             break
-        #     if not ignore:
-        #         self.register_file(dir_fd, newfile)
-        #         self.dir_fd_map[dir_fd][1].update({newfile})
+        # print("[debug] %s has added files: %s, dirs: %s"
+        # % (dir_name, new_files, new_dirs))
 
-        # file de-registration happens as a result of file events,
-        # but we need to clean up our directory map
-        #for rmfile in rm_files:
-        #    self.dir_fd_map[dir_fd][1].remove(rmfile)
+        for d_inode in new_dirs:
+            self.register_dir(dir_stats[d_inode][1],
+                              dir_stats[d_inode][0], d_inode)
+            self.dir_map[dir_inode][3].add(d_inode)
+            self.process_dir(d_inode)
+
+        for f_inode in new_files:
+            self.register_file(file_stats[f_inode][1],
+                               file_stats[f_inode][0], f_inode)
+            self.dir_map[dir_inode][2].add(f_inode)
 
         return (file_stats, dir_stats)
 
@@ -231,19 +315,21 @@ class Watcher(Thread):
 
             dir_fd = os.dup(rootfd)
             inode = os.fstat(dir_fd).st_ino
-            self.register_dir(dir_fd, root, inode, set(files), set(dirs))
+            if self.root_fd is None:
+                self.root_fd = dir_fd
 
+            file_inodes = set()
             for f in files:
-                ignore = False
-                for i in IGNORE_PATTERNS:
-                    if f.startswith(i):
-                        ignore = True
-                        break
-                if not ignore:
-                    name, fd, inode = self.fstat_by_name(f, dir_fd=dir_fd)
-                    self.register_file(fd, f, inode)
-                else:
-                    print("[ignoring %s/%s]" % (root, f))
+                if not self.ignore_file(f):
+                    _, fd, f_inode = self.fstat_by_name(f, dir_fd=dir_fd)
+                    self.register_file(fd, f, f_inode)
+                    file_inodes.add(f_inode)
+
+            # TODO: this is messy, fix when refactoring self.fstat_by_name()
+            dir_inodes = [self.fstat_by_name(d, is_dir=True, dir_fd=dir_fd)[2]
+                          for d in dirs]
+            self.register_dir(dir_fd, root, inode,
+                              set(file_inodes), set(dir_inodes))
 
         # main event loop
         while not self.die:
@@ -275,8 +361,9 @@ class Watcher(Thread):
         actions = []
 
         if flags & KQ_NOTE_RENAME:
-            self.update_dir(inode)
-            actions.append("rename")
+            if event.ident != self.root_fd:
+                new_name = self.rename_dir(inode)
+                actions.append("rename (%s -> %s)" % (dir_name, new_name))
 
         if flags & KQ_NOTE_DELETE:
             self.unregister_dir(inode)
@@ -284,8 +371,9 @@ class Watcher(Thread):
 
         if flags & KQ_NOTE_WRITE:
             if inode in self.dir_map:  # this happens if a delete occurs
-                results = self.update_dir(inode)
-                actions.append("writes (%s)" % str(results))
+                file_changes, dir_changes = self.process_dir(inode)
+                actions.append("writes (files %d, dirs %d)"
+                               % (len(file_changes), len(dir_changes)))
             else:  # ???: is this conditional still valid?
                 actions.append("writes ignored (%s)" % str(dir_name))
         if flags & KQ_NOTE_ATTRIB:
@@ -306,7 +394,7 @@ class Watcher(Thread):
         name = self.file_map[inode][1]
 
         # XXX: At the moment, we waste the fd even though it's the same
-        #      and we open a new one in the update_dir() routine calling
+        #      and we open a new one in the process_dir() routine calling
         #      register_file()
         if flags & KQ_NOTE_RENAME:
             # self.unregister_file(inode)
