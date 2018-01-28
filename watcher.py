@@ -8,6 +8,7 @@ from select import (
     KQ_NOTE_RENAME, KQ_NOTE_WRITE, KQ_NOTE_DELETE, KQ_NOTE_ATTRIB
 )
 
+# TODO: move into Watcher class and make configurable
 IGNORE_DIRS = {".git", "CVS", ".svn", ".hg"}
 IGNORE_PATTERNS = {".#"}
 
@@ -19,7 +20,12 @@ class Watcher(Thread):
     Assumptions:
       - We'll use inodes to track files/dirs through modifications
       - Inode generations aren't a thing on our file system for now
+      - Hard and Symbolic links won't be handled for now. Undefined behavior
+        will result if trying to use them.
       - Closing a file descriptor will delete corresponding kevents
+
+    Known issues:
+      - broken symlinks might break initialization or updates
     """
 
     def __init__(self, path):
@@ -154,12 +160,27 @@ class Watcher(Thread):
         return (path, fd, inode)
 
     def ignore_file(self, filename):
+        """
+        Check if a given filename should be ignored due to `IGNORE_PATTERNS`
+
+        :param filename: name of file to test
+        :returns: True if file should be ignored, otherwise False
+        """
         for pattern in IGNORE_PATTERNS:
             if filename.startswith(pattern):
                 return True
         return False
 
     def update_file(self, fd, name, inode):
+        """
+        Update our stateful view of a file, given an open file descriptor,
+        its current name, and its inode number.
+
+        :param fd: open file descriptor for file
+        :param name: name of file in file system
+        :param inode: inode number for the file
+        :returns: None
+        """
         if inode in self.file_map:
             old_fd, old_name = self.file_map[inode]
             if fd != old_fd:
@@ -171,6 +192,15 @@ class Watcher(Thread):
             self.file_map[inode] = (fd, name)
 
     def update_dir(self, fd, name, inode):
+        """
+        Update our statefule view of a directory given an open file descriptor,
+        its current name, and its inode number.
+
+        :param fd: open file descriptor to directory
+        :param name: current name of directory in file system
+        :param inode: inode number for directory
+        :returns: None
+        """
         if inode in self.dir_map:
             old_fd, old_name, files, dirs = self.dir_map[inode]
             if fd != old_fd:
@@ -182,6 +212,17 @@ class Watcher(Thread):
             self.dir_map[inode] = (fd, name, files, dirs)
 
     def inode_for(self, path, is_dir=False, dir_fd=None):
+        """
+        Get an inode for a given file by its path on the file system, using its
+        containing file directory (`dir_fd`) if known.
+
+        :param path: path to the file of interest
+        :param is_idr: boolean flag, True if the file in question is a
+                       directory, default is False if it's a regular file.
+        :param dir_fd: open file descriptor to a parent directory to use when
+                       opening the file path
+        :returns: inode number
+        """
         opts = os.O_RDONLY
         if is_dir:
             opts = os.O_RDONLY | os.O_DIRECTORY
@@ -208,7 +249,6 @@ class Watcher(Thread):
             inode = self.inode_for(path, is_dir=True, dir_fd=self.root_fd)
             if dir_inode == inode:
                 new_name = os.path.join(parent, d)
-                print("[debug] found rename target %s" % new_name)
 
         # inline function for recursively renaming children
         def rename_children(parent_path, child_inode):
