@@ -4,6 +4,16 @@ Tangle setup
 Template via https://github.com/noahp/python-packaging
 """
 from setuptools import setup
+import unittest
+
+
+def init_test_suite():
+    """ See https://stackoverflow.com/a/37033551 """
+    test_loader = unittest.TestLoader()
+    test_suite = test_loader.discover('tests', pattern='test_*.py')
+    return test_suite
+
+
 setup(
     name='tangle',
     version='0.0.1',
@@ -13,6 +23,7 @@ setup(
     url='https://github.com/voutilad/tangle',
 
     packages=['tangle'],
+    test_suite='setup.init_test_suite',
 
     # These scripts are installed to your python environment and should be
     # available on PATH after installing this package. Note that they should
