@@ -4,8 +4,8 @@ Tangle: Quantum File Entanglement
 
 The start of a bi-directional file synchronization utility. Or at least I hope.
 
-*Currently only supports BSD-like systems due to explicit usage of the
-``kqueue(2)`` event queue mechanism found in the BSDs and macOS.*
+*Currently only supports BSD-like systems due to explicit usage of the*
+``kqueue(2)`` *event queue mechanism found in the BSDs and macOS.*
 
 
 
