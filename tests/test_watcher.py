@@ -139,6 +139,61 @@ class WatcherIntegrationTests(unittest.TestCase):
         watcher.join(THREAD_WAIT)
         f.close()
 
+    def test_can_detect_deleting_directories(self):
+        """
+        Can we detect a directory delete and handle deleting subdir content?
+        """
+        watcher = self.watcher
+        f = open(os.path.join(self.tmpsubdir.name, 'junk'), 'a')
+        inode = os.stat(f.fileno()).st_ino
+        f.close()
+
+        watcher.start()
+        watcher.join(THREAD_WAIT)
+
+        self.assertIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
+        self.assertIn(inode, watcher.file_map)
+
+        self.tmpsubdir.cleanup()
+        watcher.join(THREAD_WAIT)
+
+        self.assertEqual(0, len(watcher.file_map))
+        self.assertNotIn(self.tmpsubdir_inode, watcher.dir_map)
+
+    def test_can_detect_renaming_directories(self):
+        """
+        Can we properly handle updating state during a directory rename?
+
+        This one is a bit complex as we store some relative path details.
+        """
+        watcher = self.watcher
+        with tempfile.TemporaryDirectory(dir=self.tmpsubdir.name) as subsubdir:
+            inode = os.stat(subsubdir).st_ino
+            new_name = 'junkdir'
+
+            watcher.start()
+            watcher.join(THREAD_WAIT)
+
+            self.assertIn(self.tmpsubdir.name, watcher.dir_map[inode][1])
+
+            # note: this doesn't update the TemporaryDirectory instance
+            os.rename(self.tmpsubdir.name,
+                      os.path.join(self.tmpdir.name, new_name))
+            watcher.join(THREAD_WAIT)
+
+            self.assertIn(new_name, watcher.dir_map[inode][1])
+            self.assertIn(new_name, watcher.dir_map[self.tmpsubdir_inode][1])
+            self.assertNotIn(os.path.basename(self.tmpsubdir.name),
+                             watcher.dir_map[inode][1])
+            self.assertNotIn(os.path.basename(self.tmpsubdir.name),
+                             watcher.dir_map[self.tmpsubdir_inode][1])
+
+            watcher.stop()
+            watcher.join(THREAD_WAIT)
+
+            os.rename(os.path.join(self.tmpdir.name, new_name),
+                      self.tmpsubdir.name)
+
     def tearDown(self):
         self.tmpsubdir.cleanup()
         self.tmpdir.cleanup()
