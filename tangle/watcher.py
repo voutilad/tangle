@@ -28,8 +28,8 @@ class Watcher(Thread):
       - broken symlinks might break initialization or updates
     """
 
-    def __init__(self, path):
-        super().__init__()
+    def __init__(self, path, daemon=True):
+        super().__init__(daemon=daemon)
         self.path = path
         self.root_fd = None
         self.file_map = {}     # file inode -> (fd, name)
@@ -453,7 +453,7 @@ class Watcher(Thread):
 
     def stop(self):
         """
-        Gracefully stop the `Watcher` instance, trying to close any open
+        Gracefully stop the ``Watcher`` instance, trying to close any open
         file descriptors first.
 
         :returns: None

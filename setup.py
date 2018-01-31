@@ -29,7 +29,7 @@ setup(
     # available on PATH after installing this package. Note that they should
     # be executable (`chmod +x`) and contain an appropriate shebang, such as
     # `#!/usr/bin/env` python for python scripts
-    scripts=['tangle/client.py'],
+    scripts=['tangle/bin/tangle-client.py'],
 
     # For scripts, this corrects shebang replacement, from:
     #  https://github.com/pybuilder/pybuilder/issues/168
