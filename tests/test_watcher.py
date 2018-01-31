@@ -8,7 +8,7 @@ import tempfile
 from tangle.watcher import Watcher
 
 
-THREAD_WAIT = 0.25
+THREAD_WAIT = float(os.environ.get('PYTHON_TEST_THREAD_WAIT', '0.25'))
 
 
 class WatcherUnitTests(unittest.TestCase):
@@ -37,8 +37,11 @@ class WatcherIntegrationTests(unittest.TestCase):
         """
         watcher = self.watcher
         watcher.start()
+        watcher.join(THREAD_WAIT)
+
         f1 = tempfile.NamedTemporaryFile(dir=self.tmpdir.name)
         f2 = tempfile.NamedTemporaryFile(dir=self.tmpsubdir.name)
+        watcher.join(THREAD_WAIT)
         watcher.stop()
         watcher.join(THREAD_WAIT)
 
@@ -87,11 +90,54 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertEqual(0, len(watcher.dir_map[self.tmpsubdir_inode][2]))
         self.assertEqual(1, len(watcher.dir_map[self.tmpdir_inode][3]))
 
-    def test_can_rename_files(self):
+    def test_can_detect_renaming_files(self):
         """
         Can we rename a file and appropriately update the state maps?
         """
-        pass
+        watcher = self.watcher
+        f = open(os.path.join(self.tmpdir.name, 'before'), 'a')
+        inode = os.stat(f.fileno()).st_ino
+
+        watcher.start()
+        watcher.join(THREAD_WAIT)
+
+        self.assertIn(inode, watcher.file_map)
+        self.assertEqual('before', watcher.file_map[inode][1])
+
+        os.rename(os.path.join(self.tmpdir.name, 'before'),
+                  os.path.join(self.tmpdir.name, 'after'))
+        watcher.join(THREAD_WAIT)
+
+        self.assertEqual('after', watcher.file_map[inode][1])
+        watcher.stop()
+        watcher.join(THREAD_WAIT)
+        f.close()
+
+    def test_can_detect_moving_files(self):
+        """
+        Can we detect moving files between directories and keeping state?
+        """
+        watcher = self.watcher
+        f = open(os.path.join(self.tmpdir.name, 'tango'), 'a')
+        inode = os.stat(f.fileno()).st_ino
+
+        watcher.start()
+        watcher.join(THREAD_WAIT)
+
+        self.assertIn(inode, watcher.file_map)
+        self.assertIn(inode, watcher.dir_map[self.tmpdir_inode][2])
+        self.assertNotIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
+
+        os.rename(os.path.join(self.tmpdir.name, 'tango'),
+                  os.path.join(self.tmpsubdir.name, 'tango'))
+        watcher.join(THREAD_WAIT)
+
+        self.assertNotIn(inode, watcher.dir_map[self.tmpdir_inode][2])
+        self.assertIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
+
+        watcher.stop()
+        watcher.join(THREAD_WAIT)
+        f.close()
 
     def tearDown(self):
         self.tmpsubdir.cleanup()
