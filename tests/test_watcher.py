@@ -8,19 +8,103 @@ import tempfile
 from tangle.watcher import Watcher
 
 
-THREAD_WAIT = float(os.environ.get('PYTHON_TEST_THREAD_WAIT', '0.25'))
+THREAD_WAIT = float(os.environ.get("PYTHON_TEST_THREAD_WAIT", "0.5"))
 
 
 class WatcherUnitTests(unittest.TestCase):
-
+    """
+    These tests isolate specific functionality of the Watcher class and should
+    not require creation and execution of Watcher threads. Lastly, they can be
+    safely run without race conditions.
+    """
     def setUp(self):
-        pass
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.watcher = Watcher(self.tempdir)
+
+    def test_ignoring_files_and_directories(self):
+        """
+        Files should be ignored based on a starting pattern.
+        Directories should be ignored if a complete match.
+        """
+        self.assertTrue(self.watcher.ignore_file(".#emacsfile"))
+        self.assertFalse(self.watcher.ignore_file("passwords.txt"))
+
+    def test_fstat_by_name(self):
+        """
+        Make sure we can look up an inode by just a file path.
+
+        TODO: This test makes me want to refactor the method.
+        """
+        dir_inode = os.stat(self.tempdir.name).st_ino
+        file_path = os.path.join(self.tempdir.name, "junk")
+        f = open(file_path, "a")
+        f_inode = os.fstat(f.fileno()).st_ino
+
+        path, fd, inode = self.watcher.fstat_by_name(file_path)
+        self.assertEqual(inode, f_inode)
+        self.assertEqual(path, file_path)
+        self.assertTrue(fd > 0)
+
+        dir_fd = os.open(self.tempdir.name, os.O_RDONLY|os.O_DIRECTORY)
+        path, fd, inode = self.watcher.fstat_by_name("junk", dir_fd=dir_fd)
+        self.assertEqual(inode, f_inode)
+        self.assertEqual(path, "junk")
+        self.assertTrue(fd > 0)
+
+        path, fd, inode = self.watcher.fstat_by_name(self.tempdir.name,
+                                                     is_dir=True)
+        self.assertEqual(path, self.tempdir.name)
+        self.assertEqual(dir_inode, inode)
+
+    def test_registering_directory(self):
+        """
+        Test the logic for "registering" a new directory in our state. This
+        includes tracking it in the map and staging a new kqueue event for
+        registration.
+
+        TODO: Should we test ensuring sets are created for file/dir lists?
+        """
+        self.watcher.register_dir(1, "mydir", 123)
+
+        entry = self.watcher.dir_map.get(123, None)
+        self.assertIsNotNone(entry)
+
+        self.assertEqual(1, entry[0])
+        self.assertEqual("mydir", entry[1])
+        self.assertEqual(0, len(entry[2]))
+        self.assertEqual(0, len(entry[3]))
+
+        ev = self.watcher.changelist.pop()
+        self.assertEqual(1, ev.ident)
+        self.assertEqual(123, ev.udata)
+
+        self.watcher.register_dir(2, "another", 222, {1, 2}, {5, 6, 7})
+        entry = self.watcher.dir_map[222]
+        self.assertEqual({1, 2}, entry[2])
+        self.assertEqual({5, 6, 7}, entry[3])
 
     def test_nothing(self):
-        pass
+        self.tempdir.cleanup()
 
 
 class WatcherIntegrationTests(unittest.TestCase):
+    """
+    These tests utilize a supported file system and automate creation and
+    modification of test files to evaluate if the Watcher behaves properly and
+    as designed. If these fail, it should be indicative of something worth
+    investigating.
+
+    There may be some race conditions as this does end up spawning Watcher
+    threads. Liberal calls of ``watcher.join(THREAD_WAIT)`` are used where
+    ``THREAD_WAIT`` lets the test routine safely sleep for a bit while the
+    watcher catches up to the state of the file system.
+
+    On my Lenovo x270, a ``THREAD_WAIT`` of 0.5 seconds seems to routinely be
+    safe to use.
+
+    ``THREAD_WAIT`` can be set in this module or by setting it via the
+    ``PYTHON_TEST_THREAD_WAIT`` environment variable.
+    """
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
