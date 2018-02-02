@@ -5,10 +5,12 @@ Unit tests for the Watcher portion of Tangle
 import os
 import unittest
 import tempfile
+from queue import Queue, Empty
 from tangle.watcher import Watcher
-
+from tangle.events import *
 
 THREAD_WAIT = float(os.environ.get("PYTHON_TEST_THREAD_WAIT", "0.5"))
+QUEUE_WAIT = float(os.environ.get("PYTHON_TEST_QUEUE_WAIT", "2.0"))
 
 
 class WatcherUnitTests(unittest.TestCase):
@@ -112,7 +114,14 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.tmpdir_inode = os.stat(self.tmpdir.name).st_ino
         self.tmpsubdir_inode = os.stat(self.tmpsubdir.name).st_ino
 
-        self.watcher = Watcher(self.tmpdir.name)
+        self.watcher = Watcher(self.tmpdir.name, evqueue=Queue())
+
+    def poll(self):
+        try:
+            return self.watcher.evqueue.get(timeout=QUEUE_WAIT)
+        except Empty:
+            self.assertFail("Timeout polling Watcher event queue (timeout: %d)"
+                            % timeout)
 
     def test_can_detect_adding_files(self):
         """
@@ -121,14 +130,18 @@ class WatcherIntegrationTests(unittest.TestCase):
         """
         watcher = self.watcher
         watcher.start()
-        watcher.join(THREAD_WAIT)
 
+        self.assertEqual(STARTED, self.poll().type)
+        
         f1 = tempfile.NamedTemporaryFile(dir=self.tmpdir.name)
         f2 = tempfile.NamedTemporaryFile(dir=self.tmpsubdir.name)
-        watcher.join(THREAD_WAIT)
-        watcher.stop()
-        watcher.join(THREAD_WAIT)
 
+        self.assertEqual(CREATE_FILE, self.poll().type)
+        self.assertEqual(CREATE_FILE, self.poll().type)
+
+        watcher.stop()
+        self.assertEqual(STOPPED, self.poll().type)
+        
         f1_inode = os.stat(f1.name).st_ino
         f2_inode = os.stat(f2.name).st_ino
         f1_name = os.path.basename(f1.name)
@@ -144,6 +157,8 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertEqual(f2_name, watcher.file_map[f2_inode][1])
         self.assertIn(f1_inode, watcher.dir_map[self.tmpdir_inode][2])
         self.assertIn(f2_inode, watcher.dir_map[self.tmpsubdir_inode][2])
+
+        
 
     def test_can_detect_deleting_files(self):
         """

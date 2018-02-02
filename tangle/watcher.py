@@ -1,12 +1,18 @@
 """
 File watcher for BSD-style systems using kqueue(2)
 """
+import logging
 import os
 from threading import Thread
 from select import (
     kqueue, kevent, KQ_FILTER_VNODE, KQ_EV_ADD, KQ_EV_ENABLE, KQ_EV_CLEAR,
     KQ_NOTE_RENAME, KQ_NOTE_WRITE, KQ_NOTE_DELETE, KQ_NOTE_ATTRIB
 )
+from time import time
+from tangle.events import *
+
+
+LOG = logging.getLogger(__name__)
 
 # TODO: move into Watcher class and make configurable
 IGNORE_DIRS = {".git", "CVS", ".svn", ".hg"}
@@ -28,9 +34,10 @@ class Watcher(Thread):
       - broken symlinks might break initialization or updates
     """
 
-    def __init__(self, path, daemon=True):
+    def __init__(self, path, evqueue=None, daemon=True):
         super().__init__(daemon=daemon)
         self.path = path
+        self.evqueue = evqueue
         self.root_fd = None
         self.file_map = {}     # file inode -> (fd, name)
         self.dir_map = {}       # inode -> (fd, name, {files}, {dirs})
@@ -80,8 +87,8 @@ class Watcher(Thread):
         self.dir_map[inode] = (fd, dirname, files, dirs)
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        print("[registered dir %s -> %s w/fd %s and (%d files, %d dirs)]"
-              % (inode, dirname, fd, len(files), len(dirs)))
+        LOG.debug("[registered dir %s -> %s w/fd %s and (%d files, %d dirs)]"
+                  % (inode, dirname, fd, len(files), len(dirs)))
 
     def register_file(self, fd, filename, inode):
         """
@@ -98,7 +105,7 @@ class Watcher(Thread):
         self.file_map[inode] = (fd, filename)
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        print("[registered %s -> %s in w/fd %s]" % (inode, filename, fd))
+        LOG.debug("[registered %s -> %s in w/fd %s]" % (inode, filename, fd))
         return (inode, fd)
 
     def unregister_file(self, inode):
@@ -107,15 +114,16 @@ class Watcher(Thread):
         well as tries to close it and clean up internal state.
 
         :param inode: inode of the file to unregister
-        :returns: None
+        :returns: name of the file being unregistered
         """
         if inode in self.file_map:
             fd = self.file_map[inode][0]
             os.close(fd)
             name = self.file_map[inode][1]
             del self.file_map[inode]
-            print("[unregistered file inode %d: (name: %s, fd: %d)]"
-                  % (inode, name, fd))
+            LOG.debug("[unregistered file inode %d: (name: %s, fd: %d)]"
+                      % (inode, name, fd))
+            return name
 
     def unregister_dir(self, inode):
         """
@@ -134,8 +142,8 @@ class Watcher(Thread):
             name = self.dir_map[inode][1]
             os.close(dir_fd)
             del self.dir_map[inode]
-            print("[unregistered dir inode %d: (name: %s, fd: %d)]"
-                  % (inode, name, dir_fd))
+            LOG.debug("[unregistered dir inode %d: (name: %s, fd: %d)]"
+                      % (inode, name, dir_fd))
 
     @staticmethod
     def fstat_by_name(path, is_dir=False, dir_fd=None):
@@ -187,8 +195,8 @@ class Watcher(Thread):
                 os.close(old_fd)
                 self.changelist.append(self.new_event(fd, inode))
             if old_name != name:
-                print("[debug] file rename detected %s -> %s"
-                      % (old_name, name))
+                LOG.debug("file rename detected %s -> %s"
+                          % (old_name, name))
             self.file_map[inode] = (fd, name)
 
     def update_dir(self, fd, name, inode):
@@ -207,8 +215,8 @@ class Watcher(Thread):
                 os.close(old_fd)
                 self.changelist.append(self.new_event(fd, inode))
             if old_name != name:
-                print("[debug] dir rename detected %s -> %s"
-                      % (old_name, name))
+                LOG.debug("[debug] dir rename detected %s -> %s"
+                          % (old_name, name))
             self.dir_map[inode] = (fd, name, files, dirs)
 
     def inode_for(self, path, is_dir=False, dir_fd=None):
@@ -328,17 +336,26 @@ class Watcher(Thread):
         # % (dir_name, new_files, new_dirs))
 
         for d_inode in new_dirs:
+            self.notify(CreateFileEv(d_inode, dir_stats[d_inode][1]))
             self.register_dir(dir_stats[d_inode][1],
                               dir_stats[d_inode][0], d_inode)
             self.dir_map[dir_inode][3].add(d_inode)
             self.process_dir(d_inode)
 
         for f_inode in new_files:
+            self.notify(CreateFileEv(f_inode, file_stats[f_inode][1]))
             self.register_file(file_stats[f_inode][1],
                                file_stats[f_inode][0], f_inode)
             self.dir_map[dir_inode][2].add(f_inode)
 
         return (file_stats, dir_stats)
+
+    def notify(self, event):
+        """
+        Add the given event to the internal queue.
+        """
+        LOG.info(str(event))
+        self.evqueue.put(event)
 
     def run(self):
         """
@@ -371,6 +388,9 @@ class Watcher(Thread):
             self.register_dir(dir_fd, root, inode,
                               set(file_inodes), set(dir_inodes))
 
+        # let any listeners know we're starting
+        self.notify(StartEv())
+
         # main event loop
         while not self.die:
             # ???: without a timeout, no clean way to break out!
@@ -385,6 +405,9 @@ class Watcher(Thread):
                     self.handle_dir_event(event)
                 elif inode in self.file_map:
                     self.handle_file_event(event)
+
+        # notify listeners we're done
+        self.notify(StopEv())
 
     def handle_dir_event(self, event):
         """
@@ -418,7 +441,7 @@ class Watcher(Thread):
                 actions.append("writes ignored (%s)" % str(dir_name))
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
-        print("[d!%d] (%s) %s - %s" % (inode, hex(flags), dir_name, actions))
+        LOG.info("[d!%d] (%s) %s - %s" % (inode, hex(flags), dir_name, actions))
 
     def handle_file_event(self, event):
         """
@@ -438,6 +461,7 @@ class Watcher(Thread):
         #      register_file()
         if flags & KQ_NOTE_RENAME:
             # self.unregister_file(inode)
+            self.evqueue.put(RenameEv(inode, name))
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:
@@ -449,7 +473,7 @@ class Watcher(Thread):
 
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
-        print("[f!%d] (%s) %s - %s" % (inode, hex(flags), name, actions))
+        LOG.info("[f!%d] (%s) %s - %s" % (inode, hex(flags), name, actions))
 
     def stop(self):
         """
@@ -464,13 +488,13 @@ class Watcher(Thread):
                 fd = self.file_map[inode][0]
                 os.close(fd)
             except OSError:
-                print("[e] couldn't close file fd %s" % fd)
+                LOG.warning("[e] couldn't close file fd %s" % fd)
 
         for inode in self.dir_map:
             try:
                 fd = self.dir_map[inode][0]
                 os.close(fd)
             except OSError:
-                print("[e] couldn't close dir fd %s" % fd)
+                LOG.warning("[e] couldn't close dir fd %s" % fd)
 
         self.die = True
