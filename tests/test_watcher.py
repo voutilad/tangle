@@ -246,6 +246,18 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertNotIn(inode, watcher.dir_map[self.tmpdir_inode][2])
         self.assertIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
 
+        # now move it back! turns out depending on "direction" the underlying
+        # kernel events might happen differently
+        os.rename(os.path.join(self.tmpsubdir.name, 'tango'),
+                  os.path.join(self.tmpdir.name, 'tango'))
+        ev = self.poll()
+
+        self.assertEqual(RENAME, ev.type)
+        self.assertEqual(os.path.join(self.tmpdir.name, 'tango'), ev.name)
+
+        self.assertIn(inode, watcher.dir_map[self.tmpdir_inode][2])
+        self.assertNotIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
+        
         watcher.stop()
         self.assertEqual(STOPPED, self.poll().type)
         f.close()
