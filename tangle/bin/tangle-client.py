@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import sys
-
-from watcher import Watcher
+import logging
+import queue
+from tangle.watcher import Watcher
 
 
 if __name__ == "__main__":
@@ -10,7 +11,16 @@ if __name__ == "__main__":
         path = sys.argv[1]
 
     print("Starting watcher on %s\nHit ENTER to stop." % path)
-    watcher = Watcher(path)
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    root.addHandler(ch)
+
+    watcher = Watcher(path, queue.Queue())
     watcher.start()
 
     try:

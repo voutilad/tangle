@@ -39,7 +39,7 @@ class Watcher(Thread):
         self.path = path
         self.evqueue = evqueue
         self.root_fd = None
-        self.file_map = {}     # file inode -> (fd, name)
+        self.file_map = {}     # file inode -> (fd, name, {dirs})
         self.dir_map = {}       # inode -> (fd, name, {files}, {dirs})
         self.changelist = []
         self.die = False
@@ -87,10 +87,10 @@ class Watcher(Thread):
         self.dir_map[inode] = (fd, dirname, files, dirs)
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        LOG.debug("[registered dir %s -> %s w/fd %s and (%d files, %d dirs)]"
+        LOG.info("[registered dir %s -> %s w/fd %s and (%d files, %d dirs)]"
                   % (inode, dirname, fd, len(files), len(dirs)))
 
-    def register_file(self, fd, filename, inode):
+    def register_file(self, fd, filename, inode, current_dir):
         """
         Open a file descriptor and prepare to construct a new `kevent` to add
         to `self.changelist` so they get registered during the next interaction
@@ -100,12 +100,14 @@ class Watcher(Thread):
         :param fd: open file descriptor for the file
         :param filename: `str` of the filename
         :param inode: inode number for the file
+        :param current_dir: currently known parent directory
         :returns: (inode number, file descriptor)
         """
-        self.file_map[inode] = (fd, filename)
+        self.file_map[inode] = (fd, filename, current_dir)
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        LOG.debug("[registered %s -> %s in w/fd %s]" % (inode, filename, fd))
+        LOG.info("[registered %s -> %s in %s w/fd %s]"
+                  % (inode, filename, current_dir, fd))
         return (inode, fd)
 
     def unregister_file(self, inode):
@@ -121,7 +123,7 @@ class Watcher(Thread):
             os.close(fd)
             name = self.file_map[inode][1]
             del self.file_map[inode]
-            LOG.debug("[unregistered file inode %d: (name: %s, fd: %d)]"
+            LOG.info("[unregistered file inode %d: (name: %s, fd: %d)]"
                       % (inode, name, fd))
             return name
 
@@ -142,7 +144,7 @@ class Watcher(Thread):
             name = self.dir_map[inode][1]
             os.close(dir_fd)
             del self.dir_map[inode]
-            LOG.debug("[unregistered dir inode %d: (name: %s, fd: %d)]"
+            LOG.info("[unregistered dir inode %d: (name: %s, fd: %d)]"
                       % (inode, name, dir_fd))
 
     @staticmethod
@@ -190,14 +192,14 @@ class Watcher(Thread):
         :returns: None
         """
         if inode in self.file_map:
-            old_fd, old_name = self.file_map[inode]
+            old_fd, old_name, current_dir = self.file_map[inode]
             if fd != old_fd:
                 os.close(old_fd)
                 self.changelist.append(self.new_event(fd, inode))
             if old_name != name:
-                LOG.debug("file rename detected %s -> %s"
+                LOG.info("file rename detected %s -> %s"
                           % (old_name, name))
-            self.file_map[inode] = (fd, name)
+            self.file_map[inode] = (fd, name, current_dir)
 
     def update_dir(self, fd, name, inode):
         """
@@ -215,7 +217,7 @@ class Watcher(Thread):
                 os.close(old_fd)
                 self.changelist.append(self.new_event(fd, inode))
             if old_name != name:
-                LOG.debug("[debug] dir rename detected %s -> %s"
+                LOG.info("[debug] dir rename detected %s -> %s"
                           % (old_name, name))
             self.dir_map[inode] = (fd, name, files, dirs)
 
@@ -299,13 +301,17 @@ class Watcher(Thread):
         f_inodes = set()
         for f in files:
             if not self.ignore_file(f):
-                name, fd, f_inode = self.fstat_by_name(f, dir_fd=dir_fd)
-                if f_inode in self.file_map:
-                    os.close(fd)
-                    fd = self.file_map[f_inode][0]
-                file_stats[f_inode] = (name, fd)
-                f_inodes.add(f_inode)
-                self.update_file(fd, name, f_inode)
+                try:
+                    name, fd, f_inode = self.fstat_by_name(f, dir_fd=dir_fd)
+                    if f_inode in self.file_map:
+                        os.close(fd)
+                        fd = self.file_map[f_inode][0]
+                    file_stats[f_inode] = (name, fd, root)
+                    f_inodes.add(f_inode)
+                    self.update_file(fd, name, f_inode)
+                except FileNotFoundError:
+                    # thrown by fstat_by_name()
+                    LOG.info("[possibly moved file: %s]" % f)
 
         dir_stats = {}
         d_inodes = set()
@@ -332,9 +338,7 @@ class Watcher(Thread):
         new_files = f_inodes.difference(self.dir_map[dir_inode][2])
         new_dirs = d_inodes.difference(self.dir_map[dir_inode][3])
 
-        # print("[debug] %s has added files: %s, dirs: %s"
-        # % (dir_name, new_files, new_dirs))
-
+        # Process net-new dirs and files
         for d_inode in new_dirs:
             self.notify(CreateFileEv(d_inode, dir_stats[d_inode][1]))
             self.register_dir(dir_stats[d_inode][1],
@@ -343,9 +347,11 @@ class Watcher(Thread):
             self.process_dir(d_inode)
 
         for f_inode in new_files:
-            self.notify(CreateFileEv(f_inode, file_stats[f_inode][1]))
+            if f_inode not in self.file_map:
+                self.notify(CreateFileEv(f_inode, file_stats[f_inode][1]))
             self.register_file(file_stats[f_inode][1],
-                               file_stats[f_inode][0], f_inode)
+                               file_stats[f_inode][0],
+                               f_inode, dir_name)
             self.dir_map[dir_inode][2].add(f_inode)
 
         return (file_stats, dir_stats)
@@ -379,7 +385,7 @@ class Watcher(Thread):
             for f in files:
                 if not self.ignore_file(f):
                     _, fd, f_inode = self.fstat_by_name(f, dir_fd=dir_fd)
-                    self.register_file(fd, f, f_inode)
+                    self.register_file(fd, f, f_inode, root)
                     file_inodes.add(f_inode)
 
             # TODO: this is messy, fix when refactoring self.fstat_by_name()
@@ -455,20 +461,23 @@ class Watcher(Thread):
         flags = event.fflags
         actions = []
         name = self.file_map[inode][1]
+        dirname = self.file_map[inode][2]
 
         # XXX: At the moment, we waste the fd even though it's the same
         #      and we open a new one in the process_dir() routine calling
         #      register_file()
         if flags & KQ_NOTE_RENAME:
             # self.unregister_file(inode)
-            self.evqueue.put(RenameEv(inode, name))
+            self.notify(RenameEv(inode, os.path.join(dirname, name)))
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:
             self.unregister_file(inode)
+            self.notify(DeleteEv(inode, os.path.join(dirname, name)))
             actions.append("delete")
 
         if flags & KQ_NOTE_WRITE:
+            self.notify(WriteEv(inode, os.path.join(dirname, name)))
             actions.append("write")
 
         if flags & KQ_NOTE_ATTRIB:

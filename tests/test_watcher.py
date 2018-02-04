@@ -116,12 +116,12 @@ class WatcherIntegrationTests(unittest.TestCase):
 
         self.watcher = Watcher(self.tmpdir.name, evqueue=Queue())
 
-    def poll(self):
+    def poll(self, timeout=QUEUE_WAIT):
         try:
-            return self.watcher.evqueue.get(timeout=QUEUE_WAIT)
+            return self.watcher.evqueue.get(timeout=timeout)
         except Empty:
-            self.assertFail("Timeout polling Watcher event queue (timeout: %d)"
-                            % timeout)
+            self.fail("Timeout polling Watcher event queue (timeout: %d)"
+                      % timeout)
 
     def test_can_detect_adding_files(self):
         """
@@ -141,7 +141,7 @@ class WatcherIntegrationTests(unittest.TestCase):
 
         watcher.stop()
         self.assertEqual(STOPPED, self.poll().type)
-        
+ 
         f1_inode = os.stat(f1.name).st_ino
         f2_inode = os.stat(f2.name).st_ino
         f1_name = os.path.basename(f1.name)
@@ -169,7 +169,7 @@ class WatcherIntegrationTests(unittest.TestCase):
         f2 = tempfile.NamedTemporaryFile(dir=self.tmpsubdir.name)
 
         watcher.start()
-        watcher.join(THREAD_WAIT)
+        self.assertEqual(STARTED, self.poll().type)
         self.assertEqual(2, len(watcher.file_map))
         self.assertEqual(2, len(watcher.dir_map))
         self.assertEqual(1, len(watcher.dir_map[self.tmpdir_inode][2]))
@@ -179,9 +179,15 @@ class WatcherIntegrationTests(unittest.TestCase):
         f1.close()
         f2.close()
 
-        watcher.join(THREAD_WAIT)
+        event = self.poll()
+        self.assertEqual(DELETE, event.type)
+        self.assertEqual(f1.name, event.name)
+        event = self.poll()
+        self.assertEqual(DELETE, event.type)
+        self.assertEqual(f2.name, event.name)
+
         watcher.stop()
-        watcher.join(THREAD_WAIT)
+        self.assertEqual(STOPPED, self.poll().type)
 
         self.assertEqual(0, len(watcher.file_map))
         self.assertEqual(2, len(watcher.dir_map))
@@ -198,18 +204,21 @@ class WatcherIntegrationTests(unittest.TestCase):
         inode = os.stat(f.fileno()).st_ino
 
         watcher.start()
-        watcher.join(THREAD_WAIT)
+        self.assertEqual(STARTED, self.poll().type)
 
         self.assertIn(inode, watcher.file_map)
         self.assertEqual('before', watcher.file_map[inode][1])
 
         os.rename(os.path.join(self.tmpdir.name, 'before'),
                   os.path.join(self.tmpdir.name, 'after'))
-        watcher.join(THREAD_WAIT)
-
+        ev = self.poll()
+        
+        self.assertEqual(RENAME, ev.type)
+        self.assertEqual(os.path.join(self.tmpdir.name, 'after'), ev.name)
         self.assertEqual('after', watcher.file_map[inode][1])
+
         watcher.stop()
-        watcher.join(THREAD_WAIT)
+        self.assertEqual(STOPPED, self.poll().type)
         f.close()
 
     def test_can_detect_moving_files(self):
@@ -221,7 +230,7 @@ class WatcherIntegrationTests(unittest.TestCase):
         inode = os.stat(f.fileno()).st_ino
 
         watcher.start()
-        watcher.join(THREAD_WAIT)
+        self.assertEqual(STARTED, self.poll().type)
 
         self.assertIn(inode, watcher.file_map)
         self.assertIn(inode, watcher.dir_map[self.tmpdir_inode][2])
@@ -229,13 +238,16 @@ class WatcherIntegrationTests(unittest.TestCase):
 
         os.rename(os.path.join(self.tmpdir.name, 'tango'),
                   os.path.join(self.tmpsubdir.name, 'tango'))
-        watcher.join(THREAD_WAIT)
+        ev = self.poll()
+
+        self.assertEqual(RENAME, ev.type)
+        self.assertEqual(os.path.join(self.tmpsubdir.name, 'tango'), ev.name)
 
         self.assertNotIn(inode, watcher.dir_map[self.tmpdir_inode][2])
         self.assertIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
 
         watcher.stop()
-        watcher.join(THREAD_WAIT)
+        self.assertEqual(STOPPED, self.poll().type)
         f.close()
 
     def test_can_detect_deleting_directories(self):
