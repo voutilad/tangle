@@ -10,7 +10,7 @@ from tangle.watcher import Watcher
 from tangle.events import *
 
 THREAD_WAIT = float(os.environ.get("PYTHON_TEST_THREAD_WAIT", "0.5"))
-QUEUE_WAIT = float(os.environ.get("PYTHON_TEST_QUEUE_WAIT", "2.0"))
+QUEUE_WAIT = float(os.environ.get("PYTHON_TEST_QUEUE_WAIT", "5.0"))
 
 
 class WatcherUnitTests(unittest.TestCase):
@@ -21,7 +21,7 @@ class WatcherUnitTests(unittest.TestCase):
     """
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
-        self.watcher = Watcher(self.tempdir)
+        self.watcher = Watcher(self.tempdir.name)
 
     def test_ignoring_files_and_directories(self):
         """
@@ -116,6 +116,10 @@ class WatcherIntegrationTests(unittest.TestCase):
 
         self.watcher = Watcher(self.tmpdir.name, evqueue=Queue())
 
+    def abs_tmppath(self, relpath):
+        path = os.path.join(self.tmpdir.name, relpath)
+        return os.path.abspath(os.path.realpath(os.path.join(path)))
+
     def poll(self, timeout=QUEUE_WAIT):
         try:
             return self.watcher.evqueue.get(timeout=timeout)
@@ -181,10 +185,10 @@ class WatcherIntegrationTests(unittest.TestCase):
 
         event = self.poll()
         self.assertEqual(DELETE, event.type)
-        self.assertEqual(f1.name, event.name)
+        self.assertEqual(f1.name, self.abs_tmppath(event.name))
         event = self.poll()
         self.assertEqual(DELETE, event.type)
-        self.assertEqual(f2.name, event.name)
+        self.assertEqual(f2.name, self.abs_tmppath(event.name))
 
         watcher.stop()
         self.assertEqual(STOPPED, self.poll().type)
@@ -212,9 +216,10 @@ class WatcherIntegrationTests(unittest.TestCase):
         os.rename(os.path.join(self.tmpdir.name, 'before'),
                   os.path.join(self.tmpdir.name, 'after'))
         ev = self.poll()
-        
+ 
         self.assertEqual(RENAME, ev.type)
-        self.assertEqual(os.path.join(self.tmpdir.name, 'after'), ev.name)
+        self.assertEqual(os.path.join(self.tmpdir.name, 'after'),
+                         self.abs_tmppath(ev.name))
         self.assertEqual('after', watcher.file_map[inode][1])
 
         watcher.stop()
@@ -241,7 +246,8 @@ class WatcherIntegrationTests(unittest.TestCase):
         ev = self.poll()
 
         self.assertEqual(RENAME, ev.type)
-        self.assertEqual(os.path.join(self.tmpsubdir.name, 'tango'), ev.name)
+        self.assertEqual(os.path.join(self.tmpsubdir.name, 'tango'),
+                         self.abs_tmppath(ev.name))
 
         self.assertNotIn(inode, watcher.dir_map[self.tmpdir_inode][2])
         self.assertIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
@@ -253,11 +259,12 @@ class WatcherIntegrationTests(unittest.TestCase):
         ev = self.poll()
 
         self.assertEqual(RENAME, ev.type)
-        self.assertEqual(os.path.join(self.tmpdir.name, 'tango'), ev.name)
+        self.assertEqual(os.path.join(self.tmpdir.name, 'tango'),
+                         self.abs_tmppath(ev.name))
 
         self.assertIn(inode, watcher.dir_map[self.tmpdir_inode][2])
         self.assertNotIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
-        
+ 
         watcher.stop()
         self.assertEqual(STOPPED, self.poll().type)
         f.close()
@@ -272,16 +279,25 @@ class WatcherIntegrationTests(unittest.TestCase):
         f.close()
 
         watcher.start()
-        watcher.join(THREAD_WAIT)
+        self.assertEqual(STARTED, self.poll().type)
 
         self.assertIn(inode, watcher.dir_map[self.tmpsubdir_inode][2])
         self.assertIn(inode, watcher.file_map)
 
         self.tmpsubdir.cleanup()
-        watcher.join(THREAD_WAIT)
+
+        ev = self.poll()
+        self.assertEqual(DELETE, ev.type)
+        self.assertEqual(inode, ev.inode)
+
+        ev = self.poll()
+        self.assertEqual(DELETE, ev.type)
+        self.assertEqual(self.tmpsubdir_inode, ev.inode)
 
         self.assertEqual(0, len(watcher.file_map))
         self.assertNotIn(self.tmpsubdir_inode, watcher.dir_map)
+
+        watcher.stop()
 
     def test_can_detect_renaming_directories(self):
         """
@@ -295,14 +311,18 @@ class WatcherIntegrationTests(unittest.TestCase):
             new_name = 'junkdir'
 
             watcher.start()
-            watcher.join(THREAD_WAIT)
+            self.assertEqual(STARTED, self.poll().type)
 
-            self.assertIn(self.tmpsubdir.name, watcher.dir_map[inode][1])
+            self.assertIn(self.tmpsubdir.name,
+                          self.abs_tmppath(watcher.dir_map[inode][1]))
 
             # note: this doesn't update the TemporaryDirectory instance
             os.rename(self.tmpsubdir.name,
                       os.path.join(self.tmpdir.name, new_name))
-            watcher.join(THREAD_WAIT)
+            ev = self.poll()
+            self.assertEqual(RENAME, ev.type)
+            self.assertEqual(os.path.join(self.tmpdir.name, new_name),
+                             self.abs_tmppath(ev.name))
 
             self.assertIn(new_name, watcher.dir_map[inode][1])
             self.assertIn(new_name, watcher.dir_map[self.tmpsubdir_inode][1])
@@ -312,8 +332,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                              watcher.dir_map[self.tmpsubdir_inode][1])
 
             watcher.stop()
-            watcher.join(THREAD_WAIT)
+            self.assertEqual(STOPPED, self.poll().type)
 
+            # reset so the cleanup routine succeeds.
             os.rename(os.path.join(self.tmpdir.name, new_name),
                       self.tmpsubdir.name)
 

@@ -8,8 +8,9 @@ from select import (
     kqueue, kevent, KQ_FILTER_VNODE, KQ_EV_ADD, KQ_EV_ENABLE, KQ_EV_CLEAR,
     KQ_NOTE_RENAME, KQ_NOTE_WRITE, KQ_NOTE_DELETE, KQ_NOTE_ATTRIB
 )
-from time import time
-from tangle.events import *
+from tangle.events import (
+    StartEv, StopEv, CreateFileEv, CreateDirEv, WriteEv, DeleteEv, RenameEv
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ class Watcher(Thread):
 
     def __init__(self, path, evqueue=None, daemon=True):
         super().__init__(daemon=daemon)
-        self.path = path
+        self.path = os.path.abspath(path)
         self.evqueue = evqueue
         self.root_fd = None
         self.file_map = {}     # file inode -> (fd, name, {dirs})
@@ -370,7 +371,8 @@ class Watcher(Thread):
         new events as they are returned by the kernel.
         """
         # bootstrap
-        for root, dirs, files, rootfd in os.fwalk(self.path):
+        self.root_fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY)
+        for root, dirs, files, rootfd in os.fwalk('.', dir_fd=self.root_fd):
             for i in IGNORE_DIRS:
                 if i in dirs:
                     dirs.remove(i)
@@ -378,8 +380,6 @@ class Watcher(Thread):
 
             dir_fd = os.dup(rootfd)
             inode = os.fstat(dir_fd).st_ino
-            if self.root_fd is None:
-                self.root_fd = dir_fd
 
             file_inodes = set()
             for f in files:
@@ -432,9 +432,11 @@ class Watcher(Thread):
         if flags & KQ_NOTE_RENAME:
             if event.ident != self.root_fd:
                 new_name = self.rename_dir(inode)
+                self.notify(RenameEv(inode, new_name))
                 actions.append("rename (%s -> %s)" % (dir_name, new_name))
 
         if flags & KQ_NOTE_DELETE:
+            self.notify(DeleteEv(inode, dir_name))
             self.unregister_dir(inode)
             actions.append("delete")
 
@@ -447,7 +449,8 @@ class Watcher(Thread):
                 actions.append("writes ignored (%s)" % str(dir_name))
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
-        LOG.info("[d!%d] (%s) %s - %s" % (inode, hex(flags), dir_name, actions))
+        LOG.info("[d!%d] (%s) %s - %s" %
+                 (inode, hex(flags), dir_name, actions))
 
     def handle_file_event(self, event):
         """
