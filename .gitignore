@@ -102,3 +102,4 @@ ENV/
 testdir/
 tempdir/
 .#*
+.pytest_cache
