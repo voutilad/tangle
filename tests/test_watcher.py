@@ -118,7 +118,13 @@ class WatcherIntegrationTests(unittest.TestCase):
 
     def abs_tmppath(self, relpath):
         path = os.path.join(self.tmpdir.name, relpath)
-        return os.path.abspath(os.path.realpath(os.path.join(path)))
+        path = os.path.abspath(os.path.realpath(os.path.join(path)))
+        
+        if os.uname()[0] == 'Darwin' and path.startswith('/private'):
+            # this is a hack around how macOS handles temp dirs
+            return path[len('/private'):]
+        else:
+            return path
 
     def poll(self, timeout=QUEUE_WAIT):
         try:
