@@ -107,8 +107,8 @@ class Watcher(Thread):
         self.file_map[inode] = (fd, filename, current_dir)
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        LOG.info("[registered %s -> %s in %s w/fd %s]"
-                  % (inode, filename, current_dir, fd))
+        LOG.info("[registered %s -> %s in %s w/fd %s]" % (inode, filename,
+                                                          current_dir, fd))
         return (inode, fd)
 
     def unregister_file(self, inode):
@@ -293,7 +293,12 @@ class Watcher(Thread):
         dir_fd = self.dir_map[dir_inode][0]
         dir_name = self.dir_map[dir_inode][1]
 
-        (root, dirs, files, rootfd) = next(os.fwalk(dir_fd=dir_fd))
+        try:
+            (root, dirs, files, rootfd) = next(os.fwalk(dir_fd=dir_fd))
+        except FileNotFoundError:
+            # race condition? directory may be gone!
+            return (set(), set())
+
         for i in IGNORE_DIRS:
             if i in dirs:
                 dirs.remove(i)
@@ -341,7 +346,7 @@ class Watcher(Thread):
 
         # Process net-new dirs and files
         for d_inode in new_dirs:
-            self.notify(CreateFileEv(d_inode, dir_stats[d_inode][1]))
+            self.notify(CreateDirEv(d_inode, dir_stats[d_inode][1]))
             self.register_dir(dir_stats[d_inode][1],
                               dir_stats[d_inode][0], d_inode)
             self.dir_map[dir_inode][3].add(d_inode)
