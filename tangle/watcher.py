@@ -3,6 +3,7 @@ File watcher for BSD-style systems using kqueue(2)
 """
 import logging
 import os
+from collections import namedtuple
 from threading import Thread
 from select import (
     kqueue, kevent, KQ_FILTER_VNODE, KQ_EV_ADD, KQ_EV_ENABLE, KQ_EV_CLEAR,
@@ -18,6 +19,10 @@ LOG = logging.getLogger(__name__)
 # TODO: move into Watcher class and make configurable
 IGNORE_DIRS = {".git", "CVS", ".svn", ".hg"}
 IGNORE_PATTERNS = {".#"}
+
+
+FileState = namedtuple("FileState", ["fd", "name", "dirs"])
+DirState = namedtuple("DirState", ["fd", "name", "files", "dirs"])
 
 
 class Watcher(Thread):
@@ -40,8 +45,7 @@ class Watcher(Thread):
         self.path = os.path.abspath(path)
         self.evqueue = evqueue
         self.root_fd = None
-        self.file_map = {}     # file inode -> (fd, name, {dirs})
-        self.dir_map = {}       # inode -> (fd, name, {files}, {dirs})
+        self.inode_map = {}
         self.changelist = []
         self.die = False
         self.kq = kqueue()
@@ -85,11 +89,11 @@ class Watcher(Thread):
         if dirs is None:
             dirs = set()
 
-        self.dir_map[inode] = (fd, dirname, files, dirs)
+        state = DirState(fd, dirname, files, dirs)
+        self.inode_map[inode] = state
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        LOG.info("[registered dir %s -> %s w/fd %s and (%d files, %d dirs)]"
-                  % (inode, dirname, fd, len(files), len(dirs)))
+        LOG.info("[registered %d:%s]" % (inode, str(state)))
 
     def register_file(self, fd, filename, inode, current_dir):
         """
@@ -104,49 +108,27 @@ class Watcher(Thread):
         :param current_dir: currently known parent directory
         :returns: (inode number, file descriptor)
         """
-        self.file_map[inode] = (fd, filename, current_dir)
+        state = FileState(fd, filename, current_dir)
+        self.inode_map[inode] = state
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        LOG.info("[registered %s -> %s in %s w/fd %s]" % (inode, filename,
-                                                          current_dir, fd))
+        LOG.info("[registered %d:%s]" % (inode, str(state)))
         return (inode, fd)
 
-    def unregister_file(self, inode):
+    def unregister(self, inode):
         """
         Queues up a de-registration for events on the given file descriptor as
         well as tries to close it and clean up internal state.
 
-        :param inode: inode of the file to unregister
-        :returns: name of the file being unregistered
+        :param inode: inode of the file or dir to unregister
+        :returns: name of the file or dir being unregistered
         """
-        if inode in self.file_map:
-            fd = self.file_map[inode][0]
-            os.close(fd)
-            name = self.file_map[inode][1]
-            del self.file_map[inode]
-            LOG.info("[unregistered file inode %d: (name: %s, fd: %d)]"
-                      % (inode, name, fd))
-            return name
-
-    def unregister_dir(self, inode):
-        """
-        Queues up a de-registration for events on the given directory file
-        descriptor. Also tries to close it and clean up state.
-
-        Assumes other events fire for any dependent children such as contained
-        files or subdirectories since chances are this directory described by
-        `dir_fd` has been removed from the file system as well as its contents.
-
-        :param dir_fd: file descriptor for the directory to unregister
-        :returns: None
-        """
-        if inode in self.dir_map:
-            dir_fd = self.dir_map[inode][0]
-            name = self.dir_map[inode][1]
-            os.close(dir_fd)
-            del self.dir_map[inode]
-            LOG.info("[unregistered dir inode %d: (name: %s, fd: %d)]"
-                      % (inode, name, dir_fd))
+        if inode in self.inode_map:
+            state = self.inode_map[inode]
+            os.close(state.fd)
+            del self.inode_map[inode]
+            LOG.info("[unregistered %d:%s]" % (inode, str(state)))
+            return state.name
 
     @staticmethod
     def fstat_by_name(path, is_dir=False, dir_fd=None):
@@ -182,45 +164,24 @@ class Watcher(Thread):
                 return True
         return False
 
-    def update_file(self, fd, name, inode):
+    def update_state(self, fd, name, inode):
         """
-        Update our stateful view of a file, given an open file descriptor,
-        its current name, and its inode number.
+        Update our stateful view of a file or dir, given an open file
+        descriptor, its current name, and its inode number.
 
         :param fd: open file descriptor for file
         :param name: name of file in file system
         :param inode: inode number for the file
         :returns: None
         """
-        if inode in self.file_map:
-            old_fd, old_name, current_dir = self.file_map[inode]
-            if fd != old_fd:
-                os.close(old_fd)
+        if inode in self.inode_map:
+            state = self.inode_map[inode]
+            if fd != state.fd:
+                os.close(state.fd)
                 self.changelist.append(self.new_event(fd, inode))
-            if old_name != name:
-                LOG.info("file rename detected %s -> %s"
-                          % (old_name, name))
-            self.file_map[inode] = (fd, name, current_dir)
-
-    def update_dir(self, fd, name, inode):
-        """
-        Update our statefule view of a directory given an open file descriptor,
-        its current name, and its inode number.
-
-        :param fd: open file descriptor to directory
-        :param name: current name of directory in file system
-        :param inode: inode number for directory
-        :returns: None
-        """
-        if inode in self.dir_map:
-            old_fd, old_name, files, dirs = self.dir_map[inode]
-            if fd != old_fd:
-                os.close(old_fd)
-                self.changelist.append(self.new_event(fd, inode))
-            if old_name != name:
-                LOG.info("[debug] dir rename detected %s -> %s"
-                          % (old_name, name))
-            self.dir_map[inode] = (fd, name, files, dirs)
+            if state.name != name:
+                LOG.info("rename detected %s -> %s" % (state.name, name))
+            self.inode_map[inode] = state._replace(fd=fd, name=name)
 
     def inode_for(self, path, is_dir=False, dir_fd=None):
         """
@@ -249,7 +210,7 @@ class Watcher(Thread):
         :param dir_inode: inode of directory to rename
         :returns: new name of directory
         """
-        fd, name = self.dir_map[dir_inode][:2]
+        fd, name = self.inode_map[dir_inode][:2]
         parent = os.path.dirname(name)
         new_name = ''
         root, dirs, _, _ = next(os.fwalk(parent, dir_fd=self.root_fd))
@@ -263,16 +224,21 @@ class Watcher(Thread):
 
         # inline function for recursively renaming children
         def rename_children(parent_path, child_inode):
-            fd, name, files, dirs = self.dir_map[child_inode]
+            fd, name, files, dirs = self.inode_map[child_inode]
             old_parent, dir_name = os.path.split(name)
             new_name = os.path.join(parent_path, dir_name)
-            self.dir_map[child_inode] = (fd, new_name, files, dirs)
+            self.inode_map[child_inode] = DirState(fd, new_name, files, dirs)
+            for f_inode in files:
+                state = self.inode_map[f_inode]
+                self.inode_map[f_inode] = state._replace(
+                    dirs=os.path.join(parent_path, state.name)
+                )
             for child in dirs:
                 rename_children(new_name, child)
 
         # walk the children, renaming them as we go
         if new_name:
-            for child in self.dir_map[dir_inode][3]:
+            for child in self.inode_map[dir_inode].dirs:
                 rename_children(new_name, child)
 
         return new_name
@@ -290,8 +256,8 @@ class Watcher(Thread):
         format: `{'add': (set(), set()), 'del': (set(), set())}` where each
         tuple is ordered like: `(<files>, <dirs>)`
         """
-        dir_fd = self.dir_map[dir_inode][0]
-        dir_name = self.dir_map[dir_inode][1]
+        dir_fd = self.inode_map[dir_inode].fd
+        dir_name = self.inode_map[dir_inode].name
 
         try:
             (root, dirs, files, rootfd) = next(os.fwalk(dir_fd=dir_fd))
@@ -309,12 +275,12 @@ class Watcher(Thread):
             if not self.ignore_file(f):
                 try:
                     name, fd, f_inode = self.fstat_by_name(f, dir_fd=dir_fd)
-                    if f_inode in self.file_map:
+                    if f_inode in self.inode_map:
                         os.close(fd)
-                        fd = self.file_map[f_inode][0]
+                        fd = self.inode_map[f_inode][0]
                     file_stats[f_inode] = (name, fd, root)
                     f_inodes.add(f_inode)
-                    self.update_file(fd, name, f_inode)
+                    self.update_state(fd, name, f_inode)
                 except FileNotFoundError:
                     # thrown by fstat_by_name()
                     LOG.info("[possibly moved file: %s]" % f)
@@ -322,43 +288,44 @@ class Watcher(Thread):
         dir_stats = {}
         d_inodes = set()
         for d in dirs:
-            name, fd, d_inode = self.fstat_by_name(d, is_dir=True, dir_fd=dir_fd)
-            if d_inode in self.dir_map:
+            name, fd, d_inode = self.fstat_by_name(d, is_dir=True,
+                                                   dir_fd=dir_fd)
+            if d_inode in self.inode_map:
                 os.close(fd)
-                fd = self.dir_map[d_inode][0]
+                fd = self.inode_map[d_inode][0]
             dir_stats[d_inode] = (os.path.join(dir_name, name), fd)
             d_inodes.add(d_inode)
-            self.update_dir(fd, os.path.join(dir_name, name), d_inode)
+            self.update_state(fd, os.path.join(dir_name, name), d_inode)
 
-        removed_files = self.dir_map[dir_inode][2].difference(f_inodes)
-        removed_dirs = self.dir_map[dir_inode][3].difference(d_inodes)
+        removed_files = self.inode_map[dir_inode].files.difference(f_inodes)
+        removed_dirs = self.inode_map[dir_inode].dirs.difference(d_inodes)
         # print("[debug] %s has removed files: %s, dirs: %s"
         # % (dir_name, removed_files, removed_dirs))
 
         # remove any moved files, de-reg is handled w/ KQ_NOTE_DELETE's
         for f_inode in removed_files:
-            self.dir_map[dir_inode][2].remove(f_inode)
+            self.inode_map[dir_inode].files.remove(f_inode)
         for d_inode in removed_dirs:
-            self.dir_map[dir_inode][3].remove(d_inode)
+            self.inode_map[dir_inode].dirs.remove(d_inode)
 
-        new_files = f_inodes.difference(self.dir_map[dir_inode][2])
-        new_dirs = d_inodes.difference(self.dir_map[dir_inode][3])
+        new_files = f_inodes.difference(self.inode_map[dir_inode].files)
+        new_dirs = d_inodes.difference(self.inode_map[dir_inode].dirs)
 
         # Process net-new dirs and files
         for d_inode in new_dirs:
             self.notify(CreateDirEv(d_inode, dir_stats[d_inode][1]))
             self.register_dir(dir_stats[d_inode][1],
                               dir_stats[d_inode][0], d_inode)
-            self.dir_map[dir_inode][3].add(d_inode)
+            self.inode_map[dir_inode].dirs.add(d_inode)
             self.process_dir(d_inode)
 
         for f_inode in new_files:
-            if f_inode not in self.file_map:
+            if f_inode not in self.inode_map:
                 self.notify(CreateFileEv(f_inode, file_stats[f_inode][1]))
             self.register_file(file_stats[f_inode][1],
                                file_stats[f_inode][0],
                                f_inode, dir_name)
-            self.dir_map[dir_inode][2].add(f_inode)
+            self.inode_map[dir_inode].files.add(f_inode)
 
         return (file_stats, dir_stats)
 
@@ -409,13 +376,14 @@ class Watcher(Thread):
             self.changelist.clear()
             for event in events:
                 inode = event.udata
+                state = self.inode_map.get(inode, 0)
 
-                # XXX: future idea is to add a bit to the udata to
-                #      store not just inode, but dir/file type
-                if inode in self.dir_map:
+                if isinstance(state, DirState):
                     self.handle_dir_event(event)
-                elif inode in self.file_map:
+                elif isinstance(state, FileState):
                     self.handle_file_event(event)
+                else:
+                    LOG.error("Serious state issue! Unknown inode %s" % inode)
 
         # notify listeners we're done
         self.notify(StopEv())
@@ -431,31 +399,31 @@ class Watcher(Thread):
         """
         inode = event.udata
         flags = event.fflags
-        dir_name = self.dir_map[inode]
+        state = self.inode_map[inode]
         actions = []
 
         if flags & KQ_NOTE_RENAME:
             if event.ident != self.root_fd:
                 new_name = self.rename_dir(inode)
                 self.notify(RenameEv(inode, new_name))
-                actions.append("rename (%s -> %s)" % (dir_name, new_name))
+                actions.append("rename (%s -> %s)" % (state.name, new_name))
 
         if flags & KQ_NOTE_DELETE:
-            self.notify(DeleteEv(inode, dir_name))
-            self.unregister_dir(inode)
+            self.unregister(inode)
             actions.append("delete")
+            self.notify(DeleteEv(inode, state.name))
 
         if flags & KQ_NOTE_WRITE:
-            if inode in self.dir_map:  # this happens if a delete occurs
+            if inode in self.inode_map:  # this happens if a delete occurs
                 file_changes, dir_changes = self.process_dir(inode)
                 actions.append("writes (files %d, dirs %d)"
                                % (len(file_changes), len(dir_changes)))
             else:  # ???: is this conditional still valid?
-                actions.append("writes ignored (%s)" % str(dir_name))
+                actions.append("writes ignored (%s)" % str(state.name))
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
         LOG.info("[d!%d] (%s) %s - %s" %
-                 (inode, hex(flags), dir_name, actions))
+                 (inode, hex(flags), state.name, actions))
 
     def handle_file_event(self, event):
         """
@@ -468,29 +436,29 @@ class Watcher(Thread):
         inode = event.udata
         flags = event.fflags
         actions = []
-        name = self.file_map[inode][1]
-        dirname = self.file_map[inode][2]
+        state = self.inode_map[inode]
 
         # XXX: At the moment, we waste the fd even though it's the same
         #      and we open a new one in the process_dir() routine calling
         #      register_file()
         if flags & KQ_NOTE_RENAME:
-            # self.unregister_file(inode)
-            self.notify(RenameEv(inode, os.path.join(dirname, name)))
+            # self.unregister(inode)
+            self.notify(RenameEv(inode, os.path.join(state.dirs, state.name)))
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:
-            self.unregister_file(inode)
-            self.notify(DeleteEv(inode, os.path.join(dirname, name)))
+            self.unregister(inode)
+            self.notify(DeleteEv(inode, os.path.join(state.dirs, state.name)))
             actions.append("delete")
 
         if flags & KQ_NOTE_WRITE:
-            self.notify(WriteEv(inode, os.path.join(dirname, name)))
+            self.notify(WriteEv(inode, os.path.join(state.dirs, state.name)))
             actions.append("write")
 
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
-        LOG.info("[f!%d] (%s) %s - %s" % (inode, hex(flags), name, actions))
+        LOG.info("[f!%d] (%s) %s - %s" % (inode, hex(flags), state.name,
+                                          actions))
 
     def stop(self):
         """
@@ -500,18 +468,10 @@ class Watcher(Thread):
         :returns: None
         """
         print("Stopping watcher...")
-        for inode in self.file_map:
+        for inode, state in self.inode_map.items():
             try:
-                fd = self.file_map[inode][0]
-                os.close(fd)
+                os.close(state.fd)
             except OSError:
-                LOG.warning("[e] couldn't close file fd %s" % fd)
-
-        for inode in self.dir_map:
-            try:
-                fd = self.dir_map[inode][0]
-                os.close(fd)
-            except OSError:
-                LOG.warning("[e] couldn't close dir fd %s" % fd)
+                LOG.warning("[e] couldn't close fd %s" % state.fd)
 
         self.die = True

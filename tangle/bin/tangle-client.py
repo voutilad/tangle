@@ -16,7 +16,9 @@ if __name__ == "__main__":
 
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     ch.setFormatter(formatter)
     root.addHandler(ch)
 
@@ -32,7 +34,5 @@ if __name__ == "__main__":
 
     print("Final watcher status:")
     from pprint import pprint
-    print("file_map:")
-    pprint(watcher.file_map)
-    print("dir_map:")
-    pprint(watcher.dir_map)
+    print("inode_map:")
+    pprint(watcher.inode_map)
