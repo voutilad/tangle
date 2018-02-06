@@ -467,7 +467,7 @@ class Watcher(Thread):
 
         :returns: None
         """
-        print("Stopping watcher...")
+        LOG.info("Stopping watcher...")
         for inode, state in self.inode_map.items():
             try:
                 os.close(state.fd)

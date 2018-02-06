@@ -11,8 +11,6 @@ from tangle.events import (
     STARTED, STOPPED, WRITE, DELETE, RENAME, CREATE_FILE, CREATE_DIR
 )
 
-QUEUE_WAIT = float(os.environ.get("PYTHON_TEST_QUEUE_WAIT", "0.5"))
-
 
 class WatcherUnitTests(unittest.TestCase):
     """
@@ -97,6 +95,7 @@ class WatcherIntegrationTests(unittest.TestCase):
     as designed. If these fail, it should be indicative of something worth
     investigating.
     """
+    QUEUE_WAIT = float(os.environ.get("PYTHON_TEST_QUEUE_WAIT", "2.5"))
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -116,7 +115,9 @@ class WatcherIntegrationTests(unittest.TestCase):
         else:
             return path
 
-    def poll(self, timeout=QUEUE_WAIT):
+    def poll(self, timeout=None):
+        if timeout is None:
+            timeout = self.QUEUE_WAIT
         try:
             return self.watcher.evqueue.get(timeout=timeout)
         except Empty:
