@@ -1,6 +1,8 @@
 *********************************
 Tangle: Quantum File Entanglement
 *********************************
+.. image:: https://travis-ci.org/voutilad/tangle.svg?branch=master
+    :target: https://travis-ci.org/voutilad/tangle
 
 The start of a bi-directional file synchronization utility. Or at least I hope.
 

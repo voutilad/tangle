@@ -1,5 +1,6 @@
 os: osx
+
 before_install:
   - brew install python3
-script: python setup.py test
 
+script: python3 setup.py test
