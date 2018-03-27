@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import sys
 import logging
-import queue
+from multiprocessing import Queue
+
 from tangle.watcher import Watcher
+from tangle.processor import Processor
+from tangle.events import SHUTDOWN
 
 
 if __name__ == "__main__":
@@ -21,18 +24,27 @@ if __name__ == "__main__":
     )
     ch.setFormatter(formatter)
     root.addHandler(ch)
+    log = logging.getLogger("tangle-client")
 
-    watcher = Watcher(path, queue.Queue())
+    q = Queue()
+    wq = Queue()
+    pq = Queue()
+
+    watcher = Watcher(path, q, wq)
+    processor = Processor(q, pq)
+
     watcher.start()
+    log.info(">>> watcher started with pid %s" % watcher.pid)
+    processor.start()
+    log.info(">>> processor started with pid %s" % processor.pid)
 
     try:
         input()
     except KeyboardInterrupt:
         pass
-    watcher.stop()
-    watcher.join()
+    log.info(">>> Stopping child processes")
 
-    print("Final watcher status:")
-    from pprint import pprint
-    print("inode_map:")
-    pprint(watcher.inode_map)
+    wq.put(SHUTDOWN)
+    pq.put(SHUTDOWN)
+    watcher.join()
+    processor.join()

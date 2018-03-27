@@ -4,7 +4,8 @@ File watcher for BSD-style systems using kqueue(2)
 import logging
 import os
 from collections import namedtuple
-from threading import Thread
+from multiprocessing import Process
+from queue import Empty
 from select import (
     kqueue, kevent, KQ_FILTER_VNODE, KQ_EV_ADD, KQ_EV_ENABLE, KQ_EV_CLEAR,
     KQ_NOTE_RENAME, KQ_NOTE_WRITE, KQ_NOTE_DELETE, KQ_NOTE_ATTRIB
@@ -25,7 +26,7 @@ FileState = namedtuple("FileState", ["fd", "name", "dirs"])
 DirState = namedtuple("DirState", ["fd", "name", "files", "dirs"])
 
 
-class Watcher(Thread):
+class Watcher(Process):
     """
     A kqueue specific directory and file watcher, built for BSD-like systems.
 
@@ -40,15 +41,16 @@ class Watcher(Thread):
       - broken symlinks might break initialization or updates
     """
 
-    def __init__(self, path, evqueue=None, daemon=True):
+    def __init__(self, path, queue=None, parent_queue=None, daemon=True):
         super().__init__(daemon=daemon)
         self.path = os.path.abspath(path)
-        self.evqueue = evqueue
+        self.queue = queue
+        self.parent_queue = parent_queue
         self.root_fd = None
         self.inode_map = {}
         self.changelist = []
         self.die = False
-        self.kq = kqueue()
+        # self.kq = kqueue()
 
     @staticmethod
     def new_event(fd, inode):
@@ -313,18 +315,17 @@ class Watcher(Thread):
 
         # Process net-new dirs and files
         for d_inode in new_dirs:
-            self.notify(CreateDirEv(d_inode, dir_stats[d_inode][1]))
-            self.register_dir(dir_stats[d_inode][1],
-                              dir_stats[d_inode][0], d_inode)
+            name, fd = dir_stats[d_inode][:2]
+            self.notify(CreateDirEv(d_inode, name, fd))
+            self.register_dir(fd, name, d_inode)
             self.inode_map[dir_inode].dirs.add(d_inode)
             self.process_dir(d_inode)
 
         for f_inode in new_files:
+            name, fd = file_stats[f_inode][:2]
             if f_inode not in self.inode_map:
-                self.notify(CreateFileEv(f_inode, file_stats[f_inode][1]))
-            self.register_file(file_stats[f_inode][1],
-                               file_stats[f_inode][0],
-                               f_inode, dir_name)
+                self.notify(CreateFileEv(f_inode, name, fd))
+            self.register_file(fd, name, f_inode, dir_name)
             self.inode_map[dir_inode].files.add(f_inode)
 
         return (file_stats, dir_stats)
@@ -334,7 +335,7 @@ class Watcher(Thread):
         Add the given event to the internal queue.
         """
         LOG.info(str(event))
-        self.evqueue.put(event)
+        self.queue.put(event)
 
     def run(self):
         """
@@ -343,6 +344,8 @@ class Watcher(Thread):
         new events as they are returned by the kernel.
         """
         # bootstrap
+        self.kq = kqueue()
+
         self.root_fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY)
         for root, dirs, files, rootfd in os.fwalk('.', dir_fd=self.root_fd):
             for i in IGNORE_DIRS:
@@ -384,9 +387,16 @@ class Watcher(Thread):
                     self.handle_file_event(event)
                 else:
                     LOG.error("Serious state issue! Unknown inode %s" % inode)
+            try:
+                self.parent_queue.get_nowait()
+                self.stop()
+            except Empty:
+                # TODO: add proper messaging from parent process
+                pass
 
         # notify listeners we're done
         self.notify(StopEv())
+        self.dump()
 
     def handle_dir_event(self, event):
         """
@@ -405,13 +415,13 @@ class Watcher(Thread):
         if flags & KQ_NOTE_RENAME:
             if event.ident != self.root_fd:
                 new_name = self.rename_dir(inode)
-                self.notify(RenameEv(inode, new_name))
+                self.notify(RenameEv(inode, new_name, state.fd))
                 actions.append("rename (%s -> %s)" % (state.name, new_name))
 
         if flags & KQ_NOTE_DELETE:
             self.unregister(inode)
             actions.append("delete")
-            self.notify(DeleteEv(inode, state.name))
+            self.notify(DeleteEv(inode, state.name, state.fd))
 
         if flags & KQ_NOTE_WRITE:
             if inode in self.inode_map:  # this happens if a delete occurs
@@ -422,8 +432,8 @@ class Watcher(Thread):
                 actions.append("writes ignored (%s)" % str(state.name))
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
-        LOG.debug("[d!%d] (%s) %s - %s" % (inode, hex(flags),
-                                           state.name, actions))
+        LOG.debug("[d!%d] (%s) %s@%s - %s" % (inode, hex(flags),
+                                              state.name, state.fd, actions))
 
     def handle_file_event(self, event):
         """
@@ -437,28 +447,25 @@ class Watcher(Thread):
         flags = event.fflags
         actions = []
         state = self.inode_map[inode]
+        path = os.path.join(state.dirs, state.name)
 
-        # XXX: At the moment, we waste the fd even though it's the same
-        #      and we open a new one in the process_dir() routine calling
-        #      register_file()
         if flags & KQ_NOTE_RENAME:
-            # self.unregister(inode)
-            self.notify(RenameEv(inode, os.path.join(state.dirs, state.name)))
+            self.notify(RenameEv(inode, path, state.fd))
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:
             self.unregister(inode)
-            self.notify(DeleteEv(inode, os.path.join(state.dirs, state.name)))
+            self.notify(DeleteEv(inode, state.name, state.fd))
             actions.append("delete")
 
         if flags & KQ_NOTE_WRITE:
-            self.notify(WriteEv(inode, os.path.join(state.dirs, state.name)))
+            self.notify(WriteEv(inode, state.name, state.fd))
             actions.append("write")
 
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
-        LOG.debug("[f!%d] (%s) %s - %s" % (inode, hex(flags),
-                                           state.name, actions))
+        LOG.debug("[f!%d] (%s) %s@%s - %s" % (inode, hex(flags),
+                                              state.name, state.fd, actions))
 
     def stop(self):
         """
@@ -475,3 +482,7 @@ class Watcher(Thread):
                 LOG.warning("[e] couldn't close fd %s" % state.fd)
 
         self.die = True
+
+    def dump(self):
+        from pprint import pprint
+        pprint(self.inode_map)

@@ -20,7 +20,8 @@ class EventType(Enum):
     rename = 4
     copy = 5
     started = 9
-    stopped = 10 
+    stopped = 10
+    shutdown = 69
 
 
 CREATE_FILE = EventType.create_file
@@ -31,32 +32,35 @@ RENAME = EventType.rename
 COPY = EventType.copy
 STARTED = EventType.started
 STOPPED = EventType.stopped
+SHUTDOWN = EventType.shutdown
+
+LocalEvent = namedtuple('LocalEvent', ['type', 'inode', 'time', 'name', 'fd'])
 
 
-LocalEvent = namedtuple('LocalEvent', ['type', 'inode', 'time', 'name'])
+def StartEv(): return LocalEvent(STARTED, -1, time(), '', -1)
 
 
-def StartEv(): return LocalEvent(STARTED, -1, time(), '')
+def StopEv(): return LocalEvent(STOPPED, -1, time(), '', -1)
 
 
-def StopEv(): return LocalEvent(STOPPED, -1, time(), '')
+def CreateFileEv(inode, name, fd):
+    return LocalEvent(CREATE_FILE, inode, time(), name, fd)
 
 
-def CreateFileEv(inode, name):
-    return LocalEvent(CREATE_FILE, inode, time(), name)
+def CreateDirEv(inode, name, fd):
+    return LocalEvent(CREATE_DIR, inode, time(), name, fd)
 
 
-def CreateDirEv(inode, name):
-    return LocalEvent(CREATE_DIR, inode, time(), name)
+def WriteEv(inode, name, fd):
+    return LocalEvent(WRITE, inode, time(), name, fd)
 
 
-def WriteEv(inode, name): return LocalEvent(WRITE, inode, time(), name)
+def DeleteEv(inode, name, fd):
+    return LocalEvent(DELETE, inode, time(), name, fd)
 
 
-def DeleteEv(inode, name): return LocalEvent(DELETE, inode, time(), name)
-
-
-def RenameEv(inode, name): return LocalEvent(RENAME, inode, time(), name)
+def RenameEv(inode, name, fd):
+    return LocalEvent(RENAME, inode, time(), name, fd)
 
 
 def CopyEv(inode, name):
