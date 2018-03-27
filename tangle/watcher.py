@@ -93,7 +93,7 @@ class Watcher(Thread):
         self.inode_map[inode] = state
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        LOG.info("[registered %d:%s]" % (inode, str(state)))
+        LOG.debug("[registered %d:%s]" % (inode, str(state)))
 
     def register_file(self, fd, filename, inode, current_dir):
         """
@@ -112,7 +112,7 @@ class Watcher(Thread):
         self.inode_map[inode] = state
         event = self.new_event(fd, inode)
         self.changelist.append(event)
-        LOG.info("[registered %d:%s]" % (inode, str(state)))
+        LOG.debug("[registered %d:%s]" % (inode, str(state)))
         return (inode, fd)
 
     def unregister(self, inode):
@@ -127,7 +127,7 @@ class Watcher(Thread):
             state = self.inode_map[inode]
             os.close(state.fd)
             del self.inode_map[inode]
-            LOG.info("[unregistered %d:%s]" % (inode, str(state)))
+            LOG.debug("[unregistered %d:%s]" % (inode, str(state)))
             return state.name
 
     @staticmethod
@@ -180,7 +180,7 @@ class Watcher(Thread):
                 os.close(state.fd)
                 self.changelist.append(self.new_event(fd, inode))
             if state.name != name:
-                LOG.info("rename detected %s -> %s" % (state.name, name))
+                LOG.debug("rename detected %s -> %s" % (state.name, name))
             self.inode_map[inode] = state._replace(fd=fd, name=name)
 
     def inode_for(self, path, is_dir=False, dir_fd=None):
@@ -283,7 +283,7 @@ class Watcher(Thread):
                     self.update_state(fd, name, f_inode)
                 except FileNotFoundError:
                     # thrown by fstat_by_name()
-                    LOG.info("[possibly moved file: %s]" % f)
+                    LOG.debug("[possibly moved file: %s]" % f)
 
         dir_stats = {}
         d_inodes = set()
@@ -422,8 +422,8 @@ class Watcher(Thread):
                 actions.append("writes ignored (%s)" % str(state.name))
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
-        LOG.info("[d!%d] (%s) %s - %s" %
-                 (inode, hex(flags), state.name, actions))
+        LOG.debug("[d!%d] (%s) %s - %s" % (inode, hex(flags),
+                                           state.name, actions))
 
     def handle_file_event(self, event):
         """
@@ -457,8 +457,8 @@ class Watcher(Thread):
 
         if flags & KQ_NOTE_ATTRIB:
             actions.append("attrib")
-        LOG.info("[f!%d] (%s) %s - %s" % (inode, hex(flags), state.name,
-                                          actions))
+        LOG.debug("[f!%d] (%s) %s - %s" % (inode, hex(flags),
+                                           state.name, actions))
 
     def stop(self):
         """

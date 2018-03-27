@@ -103,3 +103,4 @@ testdir/
 tempdir/
 .#*
 .pytest_cache
+TAGS

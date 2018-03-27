@@ -18,8 +18,9 @@ class EventType(Enum):
     write = 2
     delete = 3
     rename = 4
-    started = 6
-    stopped = 7
+    copy = 5
+    started = 9
+    stopped = 10 
 
 
 CREATE_FILE = EventType.create_file
@@ -27,6 +28,7 @@ CREATE_DIR = EventType.create_dir
 WRITE = EventType.write
 DELETE = EventType.delete
 RENAME = EventType.rename
+COPY = EventType.copy
 STARTED = EventType.started
 STOPPED = EventType.stopped
 
@@ -55,3 +57,7 @@ def DeleteEv(inode, name): return LocalEvent(DELETE, inode, time(), name)
 
 
 def RenameEv(inode, name): return LocalEvent(RENAME, inode, time(), name)
+
+
+def CopyEv(inode, name):
+    return LocalEvent(COPY, inode, time(), name)

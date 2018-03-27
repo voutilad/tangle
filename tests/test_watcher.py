@@ -4,11 +4,12 @@ Unit tests for the Watcher portion of Tangle
 """
 import os
 import unittest
+import shutil
 import tempfile
 from queue import Queue, Empty
 from tangle.watcher import Watcher
 from tangle.events import (
-    STARTED, STOPPED, WRITE, DELETE, RENAME, CREATE_FILE, CREATE_DIR
+    STARTED, STOPPED, WRITE, DELETE, RENAME, CREATE_FILE, CREATE_DIR, COPY
 )
 
 
@@ -217,6 +218,24 @@ class WatcherIntegrationTests(unittest.TestCase):
         watcher.stop()
         self.assertEqual(STOPPED, self.poll().type)
         f.close()
+
+    def test_can_detect_copying_files(self):
+        """
+        Can we detect the copying of a file?
+
+        Turns out this really results in a CREATE event where we get
+        a new inode and everything.
+        """
+        watcher = self.watcher
+        f = tempfile.NamedTemporaryFile(dir=self.tmpdir.name)
+
+        watcher.start()
+        self.assertEqual(STARTED, self.poll().type)
+
+        shutil.copy(f.name, os.path.join(self.tmpdir.name, "a_copy"))
+
+        ev = self.poll()
+        self.assertEqual(CREATE_FILE, ev.type)
 
     def test_can_detect_moving_files(self):
         """
