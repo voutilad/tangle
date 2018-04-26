@@ -4,14 +4,19 @@ Unit tests for the Watcher portion of Tangle
 """
 import os
 import unittest
+from unittest.mock import MagicMock, patch
+from selectors import DefaultSelector, EVENT_READ
 import shutil
+import socket
 import tempfile
 from multiprocessing import Queue
 from queue import Empty
+
+from tangle.comm import recv_event
 from tangle.watcher import Watcher
 from tangle.events import (
     SHUTDOWN, STARTED, STOPPED,
-    WRITE, DELETE, RENAME, CREATE_FILE, CREATE_DIR
+    WRITE, DELETE, RENAME_FILE, RENAME_DIR, CREATE_FILE, CREATE_DIR
 )
 
 
@@ -102,16 +107,34 @@ class WatcherIntegrationTests(unittest.TestCase):
     QUEUE_WAIT = float(os.environ.get("PYTHON_TEST_QUEUE_WAIT", "5"))
 
     def setUp(self):
+        self.sockfile = tempfile.NamedTemporaryFile()
+        self.sockfile.close()
+
         self.tmpdir = tempfile.TemporaryDirectory()
         self.tmpsubdir = tempfile.TemporaryDirectory(dir=self.tmpdir.name)
         self.tmpdir_inode = os.stat(self.tmpdir.name).st_ino
         self.tmpsubdir_inode = os.stat(self.tmpsubdir.name).st_ino
 
-        self.queue = Queue()
+        # patch.object(Watcher, 'notify', mock_send_event).start()
+        # patch.object(Watcher, 'connect').start()
+
+        self.socket = socket.socket(family=socket.AF_UNIX)
+        self.socket.bind(self.sockfile.name)
+        self.socket.listen()
+
+        self.msg_queue = Queue()
         self.parent_queue = Queue()
+        print('Creating Watcher with socket file: %s' % self.sockfile.name)
         self.watcher = Watcher(self.tmpdir.name,
-                               queue=self.queue,
+                               sockname=self.sockfile.name,
                                parent_queue=self.parent_queue)
+       # self.addCleanup(patch.stopall())
+
+    def tearDown(self):
+        self.tmpsubdir.cleanup()
+        self.tmpdir.cleanup()
+        self.socket.close()
+        # self.sockfile.close()
 
     def abs_tmppath(self, relpath):
         path = os.path.join(self.tmpdir.name, relpath)
@@ -123,11 +146,12 @@ class WatcherIntegrationTests(unittest.TestCase):
         else:
             return path
 
-    def poll(self, timeout=None):
+    def poll(self, sock, timeout=None):
         if timeout is None:
             timeout = self.QUEUE_WAIT
         try:
-            return self.queue.get(timeout=timeout)
+            (event, _) = recv_event(sock, timeout=timeout)
+            return event
         except Empty:
             self.fail("Timeout polling Watcher event queue (timeout: %d)"
                       % timeout)
@@ -142,29 +166,42 @@ class WatcherIntegrationTests(unittest.TestCase):
         if exp_name:
             self.assertEqual(exp_name, event.name)
 
+    def start_watcher(self):
+        self.watcher.start()
+        sel = DefaultSelector()
+
+        sel.register(self.socket, EVENT_READ)
+        events = sel.select(timeout=self.QUEUE_WAIT)
+        sel.unregister(self.socket)
+
+        if len(events) > 0:
+            conn, _ = self.socket.accept()
+            return conn
+        self.fail('Could not start watcher. Timeout waiting for socket connection.')
+
     def test_can_detect_adding_files(self):
         """
         Adding files should result in adding them to the file and directory
         states.
         """
-        watcher = self.watcher
-        watcher.start()
+        conn = self.start_watcher()
 
-        self.assertEqual(STARTED, self.poll().type)
+        self.assertEqual(STARTED, self.poll(conn).type)
 
         f1 = tempfile.NamedTemporaryFile(dir=self.tmpdir.name)
         f1_inode = os.stat(f1.name).st_ino
         f2 = tempfile.NamedTemporaryFile(dir=self.tmpsubdir.name)
         f2_inode = os.stat(f2.name).st_ino
 
-        self.assertEvent(self.poll(),
+        self.assertEvent(self.poll(conn),
                          CREATE_FILE, f1_inode, os.path.basename(f1.name))
-        self.assertEvent(self.poll(),
+        self.assertEvent(self.poll(conn),
                          CREATE_FILE, f2_inode, os.path.basename(f2.name))
 
         self.stop_watcher()
-        self.assertEqual(STOPPED, self.poll().type)
+        self.assertEqual(STOPPED, self.poll(conn).type)
 
+        conn.close()
         f1.close()
         f2.close()
 
@@ -172,57 +209,47 @@ class WatcherIntegrationTests(unittest.TestCase):
         """
         Deleting files should remove them from the file and directory states.
         """
-        watcher = self.watcher
         f1 = tempfile.NamedTemporaryFile(dir=self.tmpdir.name)
         f2 = tempfile.NamedTemporaryFile(dir=self.tmpsubdir.name)
 
-        watcher.start()
-        self.assertEqual(STARTED, self.poll().type)
+        conn = self.start_watcher()
+        self.assertEqual(STARTED, self.poll(conn).type)
 
         f2.close()
-        event = self.poll()
+        event = self.poll(conn)
         self.assertEqual(DELETE, event.type)
         self.assertEqual(os.path.basename(f2.name), event.name)
 
         f1.close()
-        event = self.poll()
+        event = self.poll(conn)
         self.assertEqual(DELETE, event.type)
         self.assertEqual(os.path.basename(f1.name), event.name)
 
         self.stop_watcher()
-        self.assertEqual(STOPPED, self.poll().type)
-
-        #self.assertEqual(2, len(watcher.inode_map))
-        #self.assertEqual(0, len(watcher.inode_map[self.tmpdir_inode].files))
-        #self.assertEqual(0, len(watcher.inode_map[self.tmpsubdir_inode].files))
-        #self.assertEqual(1, len(watcher.inode_map[self.tmpdir_inode].dirs))
+        self.assertEqual(STOPPED, self.poll(conn).type)
+        conn.close()
 
     def test_can_detect_renaming_files(self):
         """
         Can we rename a file and appropriately update the state maps?
         """
-        watcher = self.watcher
         f = open(os.path.join(self.tmpdir.name, 'before'), 'a')
-        #inode = os.stat(f.fileno()).st_ino
 
-        watcher.start()
-        self.assertEqual(STARTED, self.poll().type)
-
-        #self.assertIn(inode, watcher.inode_map)
-        #self.assertEqual('before', watcher.inode_map[inode].name)
+        conn = self.start_watcher()
+        self.assertEqual(STARTED, self.poll(conn).type)
 
         os.rename(os.path.join(self.tmpdir.name, 'before'),
                   os.path.join(self.tmpdir.name, 'after'))
-        ev = self.poll()
+        ev = self.poll(conn)
 
-        self.assertEqual(RENAME, ev.type)
+        self.assertEqual(RENAME_FILE, ev.type)
         self.assertEqual(os.path.join(self.tmpdir.name, 'after'),
                          self.abs_tmppath(ev.name))
-        #self.assertEqual('after', watcher.inode_map[inode].name)
 
         self.stop_watcher()
-        self.assertEqual(STOPPED, self.poll().type)
+        self.assertEqual(STOPPED, self.poll(conn).type)
         f.close()
+        conn.close()
 
     def test_can_detect_copying_files(self):
         """
@@ -231,88 +258,69 @@ class WatcherIntegrationTests(unittest.TestCase):
         Turns out this really results in a CREATE event where we get
         a new inode and everything.
         """
-        watcher = self.watcher
         f = tempfile.NamedTemporaryFile(dir=self.tmpdir.name)
 
-        watcher.start()
-        self.assertEqual(STARTED, self.poll().type)
+        conn = self.start_watcher()
+        self.assertEqual(STARTED, self.poll(conn).type)
 
         shutil.copy(f.name, os.path.join(self.tmpdir.name, "a_copy"))
 
-        ev = self.poll()
+        ev = self.poll(conn)
         self.assertEqual(CREATE_FILE, ev.type)
+        conn.close()
 
     def test_can_detect_moving_files(self):
         """
         Can we detect moving files between directories and keeping state?
         """
-        watcher = self.watcher
         f = open(os.path.join(self.tmpdir.name, 'tango'), 'a')
-        inode = os.stat(f.fileno()).st_ino
 
-        watcher.start()
-        self.assertEqual(STARTED, self.poll().type)
-
-        #self.assertIn(inode, watcher.inode_map)
-        #self.assertIn(inode, watcher.inode_map[self.tmpdir_inode].files)
-        #self.assertNotIn(inode, watcher.inode_map[self.tmpsubdir_inode].files)
+        conn = self.start_watcher()
+        self.assertEqual(STARTED, self.poll(conn).type)
 
         os.rename(os.path.join(self.tmpdir.name, 'tango'),
                   os.path.join(self.tmpsubdir.name, 'tango'))
-        ev = self.poll()
+        ev = self.poll(conn)
 
-        self.assertEqual(RENAME, ev.type)
+        self.assertEqual(RENAME_FILE, ev.type)
         self.assertEqual(os.path.join(self.tmpsubdir.name, 'tango'),
                          self.abs_tmppath(ev.name))
-
-        #self.assertNotIn(inode, watcher.inode_map[self.tmpdir_inode].files)
-        #self.assertIn(inode, watcher.inode_map[self.tmpsubdir_inode].files)
 
         # now move it back! turns out depending on "direction" the underlying
         # kernel events might happen differently
         os.rename(os.path.join(self.tmpsubdir.name, 'tango'),
                   os.path.join(self.tmpdir.name, 'tango'))
-        ev = self.poll()
+        ev = self.poll(conn)
 
-        self.assertEqual(RENAME, ev.type)
+        self.assertEqual(RENAME_FILE, ev.type)
         self.assertEqual(os.path.join(self.tmpdir.name, 'tango'),
                          self.abs_tmppath(ev.name))
 
-        #self.assertIn(inode, watcher.inode_map[self.tmpdir_inode].files)
-        #self.assertNotIn(inode, watcher.inode_map[self.tmpsubdir_inode].files)
-
         self.stop_watcher()
-        self.assertEqual(STOPPED, self.poll().type)
+        self.assertEqual(STOPPED, self.poll(conn).type)
         f.close()
+        conn.close()
 
     def test_can_detect_deleting_directories(self):
         """
         Can we detect a directory delete and handle deleting subdir content?
         """
-        watcher = self.watcher
         f = open(os.path.join(self.tmpsubdir.name, 'junk'), 'a')
-        #inode = os.stat(f.fileno()).st_ino
         f.close()
 
-        watcher.start()
-        self.assertEqual(STARTED, self.poll().type)
-
-        #self.assertIn(inode, watcher.inode_map[self.tmpsubdir_inode].files)
-        #self.assertIn(inode, watcher.inode_map)
+        conn = self.start_watcher()
+        self.assertEqual(STARTED, self.poll(conn).type)
 
         self.tmpsubdir.cleanup()
 
-        ev = self.poll()
+        ev = self.poll(conn)
         self.assertEqual(DELETE, ev.type)
-        #self.assertEqual(inode, ev.inode)
 
-        ev = self.poll()
+        ev = self.poll(conn)
         self.assertEqual(DELETE, ev.type)
-        #self.assertEqual(self.tmpsubdir_inode, ev.inode)
-
-        #self.assertNotIn(self.tmpsubdir_inode, watcher.inode_map)
 
         self.stop_watcher()
+        conn.close()
 
     def test_can_detect_renaming_directories(self):
         """
@@ -320,74 +328,56 @@ class WatcherIntegrationTests(unittest.TestCase):
 
         This one is a bit complex as we store some relative path details.
         """
-        watcher = self.watcher
         with tempfile.TemporaryDirectory(dir=self.tmpsubdir.name) as subsubdir:
-            # inode = os.stat(subsubdir).st_ino
             new_name = 'junkdir'
 
             f = open(os.path.join(subsubdir, 'junkfile'), 'a')
-            # f_inode = os.stat(f.fileno()).st_ino
-
-            watcher.start()
-            self.assertEqual(STARTED, self.poll().type)
-
-            # self.assertIn(self.tmpsubdir.name,
-            #              self.abs_tmppath(watcher.inode_map[inode].name))
-            # self.assertIn(self.tmpsubdir.name,
-            #              self.abs_tmppath(watcher.inode_map[f_inode].dirs))
+            conn = self.start_watcher()
+            self.assertEqual(STARTED, self.poll(conn).type)
 
             # note: this doesn't update the TemporaryDirectory instance
             os.rename(self.tmpsubdir.name,
                       os.path.join(self.tmpdir.name, new_name))
-            ev = self.poll()
-            self.assertEqual(RENAME, ev.type)
+            ev = self.poll(conn)
+            self.assertEqual(RENAME_DIR, ev.type)
             self.assertEqual(os.path.join(self.tmpdir.name, new_name),
                              self.abs_tmppath(ev.name))
 
-            # self.assertIn(new_name, watcher.inode_map[inode].name)
-            # self.assertIn(new_name,
-            #              watcher.inode_map[self.tmpsubdir_inode].name)
-            # self.assertIn(new_name, watcher.inode_map[f_inode].dirs)
-            # self.assertNotIn(os.path.basename(self.tmpsubdir.name),
-            #                 watcher.inode_map[inode].name)
-            # self.assertNotIn(os.path.basename(self.tmpsubdir.name),
-            #                 watcher.inode_map[self.tmpsubdir_inode].name)
-
             self.stop_watcher()
-            self.assertEqual(STOPPED, self.poll().type)
+            self.assertEqual(STOPPED, self.poll(conn).type)
 
             f.close()
+            conn.close()
             # reset so the cleanup routine succeeds.
             os.rename(os.path.join(self.tmpdir.name, new_name),
                       self.tmpsubdir.name)
 
     def test_can_detect_file_writes(self):
-        watcher = self.watcher
         with open(os.path.join(self.tmpdir.name, "junk"), "a") as f:
             inode = os.stat(f.fileno()).st_ino
 
-            watcher.start()
-            self.assertEqual(STARTED, self.poll().type)
+            conn = self.start_watcher()
+            self.assertEqual(STARTED, self.poll(conn).type)
 
             f.write("don't stop believing")
             f.flush()
-            ev = self.poll()
+            ev = self.poll(conn)
 
             self.assertEqual(WRITE, ev.type)
             self.assertEqual(inode, ev.inode)
 
             self.stop_watcher()
-            self.assertEqual(STOPPED, self.poll().type)
+            self.assertEqual(STOPPED, self.poll(conn).type)
+            conn.close()
 
     def test_can_detect_directory_creation(self):
-        watcher = self.watcher
-        watcher.start()
-        self.assertEqual(STARTED, self.poll().type)
+        conn = self.start_watcher()
+        self.assertEqual(STARTED, self.poll(conn).type)
 
         path = os.path.join(self.tmpdir.name, 'junkdir')
         os.mkdir(path)
 
-        ev = self.poll()
+        ev = self.poll(conn)
         self.assertEqual(CREATE_DIR, ev.type)
 
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
@@ -396,11 +386,8 @@ class WatcherIntegrationTests(unittest.TestCase):
         os.close(fd)
 
         self.stop_watcher()
-        self.assertEqual(STOPPED, self.poll().type)
-
-    def tearDown(self):
-        self.tmpsubdir.cleanup()
-        self.tmpdir.cleanup()
+        self.assertEqual(STOPPED, self.poll(conn).type)
+        conn.close()
 
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@ File watcher for BSD-style systems using kqueue(2)
 """
 import logging
 import os
+import socket
 from collections import namedtuple
 from multiprocessing import Process
 from queue import Empty
@@ -10,8 +11,10 @@ from select import (
     kqueue, kevent, KQ_FILTER_VNODE, KQ_EV_ADD, KQ_EV_ENABLE, KQ_EV_CLEAR,
     KQ_NOTE_RENAME, KQ_NOTE_WRITE, KQ_NOTE_DELETE, KQ_NOTE_ATTRIB
 )
+from tangle.comm import send_event
 from tangle.events import (
-    StartEv, StopEv, CreateFileEv, CreateDirEv, WriteEv, DeleteEv, RenameEv
+    StartEv, StopEv, CreateFileEv, CreateDirEv, WriteEv, DeleteEv,
+    RenameFileEv, RenameDirEv
 )
 
 
@@ -41,12 +44,12 @@ class Watcher(Process):
       - broken symlinks might break initialization or updates
     """
 
-    def __init__(self, path, queue=None, parent_queue=None, daemon=True):
+    def __init__(self, path, parent_queue=None, sockname=None, daemon=True):
         super().__init__(daemon=daemon)
         self.path = os.path.abspath(path)
-        self.queue = queue
         self.parent_queue = parent_queue
         self.root_fd = None
+        self.sockname = sockname
         self.inode_map = {}
         self.changelist = []
         self.die = False
@@ -335,7 +338,17 @@ class Watcher(Process):
         Add the given event to the internal queue.
         """
         LOG.info(str(event))
-        self.queue.put(event)
+        # LOG.info('XXX sanity check: %s' % str(os.fstat(event.fd)))
+        send_event(self.sock, event)
+
+    def connect(self):
+        """
+        Try to connect to a Processor via a socket
+        """
+        LOG.info('Opening socket on %s' % self.sockname)
+        self.sock = socket.socket(family=socket.AF_UNIX)
+        self.sock.connect(self.sockname)
+        LOG.info('Connected via %s' % self.sockname)
 
     def run(self):
         """
@@ -369,7 +382,7 @@ class Watcher(Process):
             self.register_dir(dir_fd, root, inode,
                               set(file_inodes), set(dir_inodes))
 
-        # let any listeners know we're starting
+        self.connect()
         self.notify(StartEv())
 
         # main event loop
@@ -396,6 +409,7 @@ class Watcher(Process):
 
         # notify listeners we're done
         self.notify(StopEv())
+        # self.parent_queue.put_nowait(StopEv())
         self.dump()
 
     def handle_dir_event(self, event):
@@ -415,7 +429,7 @@ class Watcher(Process):
         if flags & KQ_NOTE_RENAME:
             if event.ident != self.root_fd:
                 new_name = self.rename_dir(inode)
-                self.notify(RenameEv(inode, new_name, state.fd))
+                self.notify(RenameDirEv(inode, new_name, state.fd))
                 actions.append("rename (%s -> %s)" % (state.name, new_name))
 
         if flags & KQ_NOTE_DELETE:
@@ -450,7 +464,7 @@ class Watcher(Process):
         path = os.path.join(state.dirs, state.name)
 
         if flags & KQ_NOTE_RENAME:
-            self.notify(RenameEv(inode, path, state.fd))
+            self.notify(RenameFileEv(inode, path, state.fd))
             actions.append("rename")
 
         if flags & KQ_NOTE_DELETE:

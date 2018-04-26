@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import sys
 import logging
 from multiprocessing import Queue
@@ -7,6 +8,7 @@ from tangle.watcher import Watcher
 from tangle.processor import Processor
 from tangle.events import SHUTDOWN
 
+SOCKNAME = '.sock'
 
 if __name__ == "__main__":
     path = "."
@@ -26,17 +28,17 @@ if __name__ == "__main__":
     root.addHandler(ch)
     log = logging.getLogger("tangle-client")
 
-    q = Queue()
     wq = Queue()
     pq = Queue()
 
-    watcher = Watcher(path, q, wq)
-    processor = Processor(q, pq)
+    watcher = Watcher(path, wq, sockname=SOCKNAME)
+    processor = Processor(pq, sockname=SOCKNAME, daemon=False)
+
+    processor.start()
+    log.info(">>> processor started with pid %s" % processor.pid)
 
     watcher.start()
     log.info(">>> watcher started with pid %s" % watcher.pid)
-    processor.start()
-    log.info(">>> processor started with pid %s" % processor.pid)
 
     try:
         input()
@@ -48,3 +50,8 @@ if __name__ == "__main__":
     pq.put(SHUTDOWN)
     watcher.join()
     processor.join()
+
+    try:
+        os.remove(SOCKNAME)
+    except:
+        log.info('>>> Failed to remove socket %s!' % SOCKNAME)
