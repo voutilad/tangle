@@ -500,3 +500,31 @@ class Watcher(Process):
     def dump(self):
         from pprint import pprint
         pprint(self.inode_map)
+
+
+if __name__ == '__main__':
+    from multiprocessing import Queue
+    import signal
+    import sys
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    ch.setFormatter(formatter)
+    root.addHandler(ch)
+    LOG = logging.getLogger('Watcher')
+
+    LOG.info('Initializing processor...')
+    q = Queue()
+    watcher = Watcher('./tmp', q, '.sock', daemon=False)
+
+    def handle_interrupt(signum, frame):
+        LOG.info('Interrupting watcher...')
+        q.put_nowait('stop please')
+
+    signal.signal(signal.SIGINT, handle_interrupt)
+    watcher.run()

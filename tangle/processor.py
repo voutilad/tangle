@@ -2,14 +2,13 @@
 """
 Tangle Event Processor
 """
-import array
 import logging
 import os
 import selectors
 import socket
 from queue import Empty
 from threading import Thread
-from multiprocessing import Process, Queue
+from multiprocessing import Process
 from tangle.comm import recv_event
 
 
@@ -61,6 +60,9 @@ class Processor(Process):
         self.die = True
 
     def should_stop(self):
+        if self.die:
+            return True
+
         try:
             self.parent_queue.get_nowait()
             return True
@@ -90,6 +92,9 @@ class Processor(Process):
                 conn, _ = sock.accept()
                 LOG.info('connected on socket %s' % self.sockname)
                 break
+            elif self.should_stop():
+                sock.close()
+                return
 
         if not conn:
             LOG.info('no connection within timeout.')
@@ -115,4 +120,31 @@ class Processor(Process):
 
         conn.close()
         sock.close()
-        self.stop()
+        os.unlink(self.sockname)
+
+
+if __name__ == '__main__':
+    from multiprocessing import Queue
+    import signal
+    import sys
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    ch.setFormatter(formatter)
+    root.addHandler(ch)
+    LOG = logging.getLogger('Processor')
+
+    LOG.info('Initializing processor...')
+    processor = Processor(Queue(), '.sock', daemon=False)
+
+    def handle_interrupt(signum, frame):
+        LOG.info('Interrupting processor...')
+        processor.stop()
+    signal.signal(signal.SIGINT, handle_interrupt)
+
+    processor.run()
