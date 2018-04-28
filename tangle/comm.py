@@ -3,8 +3,9 @@ import logging
 import os
 import socket
 from selectors import DefaultSelector, EVENT_READ
-from tangle.events import dump_event, load_event, CREATE_FILE, WRITE, RENAME_FILE, RENAME_DIR
-
+from tangle.events import (
+    dump_event, load_event, CREATE_FILE, WRITE, RENAME_FILE, RENAME_DIR
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -45,7 +46,11 @@ def recv_event(sock, timeout=None):
 
     # Case where we're not sending File Descrpitors
     if anc_data is None or len(anc_data) < 1:
-        return load_event(data), None
+        try:
+            return load_event(data), None
+        except EOFError:
+            # why does this happen???
+            return None, None
 
     # Otherwise, let's look for file descriptors in the ancillary data
     for (level, msgtype, payload) in anc_data:

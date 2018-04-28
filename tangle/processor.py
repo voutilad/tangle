@@ -77,6 +77,10 @@ class Processor(Process):
 
         LOG.info('Opening socket on %s...' % self.sockname)
         sock = socket.socket(family=socket.AF_UNIX)
+        try:
+            os.unlink(self.sockname)
+        except FileNotFoundError:
+            pass
         sock.bind(self.sockname)
         sock.listen(100)
 

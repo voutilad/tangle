@@ -4,6 +4,7 @@ File watcher for BSD-style systems using kqueue(2)
 import logging
 import os
 import socket
+from time import sleep
 from collections import namedtuple
 from multiprocessing import Process
 from queue import Empty
@@ -347,8 +348,20 @@ class Watcher(Process):
         """
         LOG.info('Opening socket on %s' % self.sockname)
         self.sock = socket.socket(family=socket.AF_UNIX)
-        self.sock.connect(self.sockname)
-        LOG.info('Connected via %s' % self.sockname)
+        for i in range(10):
+            try:
+                self.sock.connect(self.sockname)
+                break
+            except FileNotFoundError:
+                LOG.info('Waiting for unix socket creation...')
+                sleep(3)
+            except ConnectionRefusedError:
+                LOG.info('Waiting for connection on unix socket...')
+                sleep(3)
+
+        if self.sock.getpeername():
+            return True
+        return False
 
     def run(self):
         """
@@ -382,7 +395,11 @@ class Watcher(Process):
             self.register_dir(dir_fd, root, inode,
                               set(file_inodes), set(dir_inodes))
 
-        self.connect()
+        if not self.connect():
+            LOG.info('Failed to connect to socket %s' % self.sockname)
+            self.stop()
+            return
+
         self.notify(StartEv())
 
         # main event loop
