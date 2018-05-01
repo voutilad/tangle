@@ -4,7 +4,6 @@ Unit tests for the Watcher portion of Tangle
 """
 import os
 import unittest
-from unittest.mock import MagicMock, patch
 from selectors import DefaultSelector, EVENT_READ
 import shutil
 import socket
@@ -115,9 +114,6 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.tmpdir_inode = os.stat(self.tmpdir.name).st_ino
         self.tmpsubdir_inode = os.stat(self.tmpsubdir.name).st_ino
 
-        # patch.object(Watcher, 'notify', mock_send_event).start()
-        # patch.object(Watcher, 'connect').start()
-
         self.socket = socket.socket(family=socket.AF_UNIX)
         self.socket.bind(self.sockfile.name)
         self.socket.listen()
@@ -128,13 +124,11 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.watcher = Watcher(self.tmpdir.name,
                                sockname=self.sockfile.name,
                                parent_queue=self.parent_queue)
-       # self.addCleanup(patch.stopall())
 
     def tearDown(self):
         self.tmpsubdir.cleanup()
         self.tmpdir.cleanup()
         self.socket.close()
-        # self.sockfile.close()
 
     def abs_tmppath(self, relpath):
         path = os.path.join(self.tmpdir.name, relpath)

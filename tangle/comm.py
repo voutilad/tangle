@@ -15,7 +15,7 @@ LOG = logging.getLogger(__name__)
 def send_event(sock, event):
     """
     Send a LocalEvent over a given socket including the approrpriate file
-    descriptor
+    descriptor.
     """
     msg = dump_event(event)
 
@@ -24,13 +24,15 @@ def send_event(sock, event):
                      array.array('i', [event.fd]))]
         return sock.sendmsg([msg], anc_data)
     # TODO: handle partial sends and resend remaining data?
-    return sock.sendmsg([msg])
+    return sock.sendall(msg)
 
 
 def recv_event(sock, timeout=None):
     """
     Receive an LocalEvent via a given socket, expecting a file descriptor
     as well.
+
+    Assumes that LocalEvents are < 4 KB and we're not interrupted.
     """
     sel = DefaultSelector()
     sel.register(sock, EVENT_READ)
